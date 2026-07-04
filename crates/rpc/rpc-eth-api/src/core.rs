@@ -5,7 +5,8 @@ use crate::{
     RpcBlock, RpcHeader, RpcReceipt, RpcTransaction,
 };
 use alloy_dyn_abi::TypedData;
-use alloy_eips::{eip2930::AccessListResult, BlockId, BlockNumberOrTag};
+use alloy_eips::{BlockId, BlockNumberOrTag};
+use crate::helpers::call::EnhancedAccessListResult;
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Address, Bytes, B256, B64, U256, U64};
 use alloy_rpc_types_eth::{
@@ -258,7 +259,7 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
         request: TxReq,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
-    ) -> RpcResult<AccessListResult>;
+    ) -> RpcResult<EnhancedAccessListResult>;
 
     /// Generates and returns an estimate of how much gas is necessary to allow the transaction to
     /// complete.
@@ -699,7 +700,7 @@ where
         request: RpcTxReq<T::NetworkTypes>,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
-    ) -> RpcResult<AccessListResult> {
+    ) -> RpcResult<EnhancedAccessListResult> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_override, "Serving eth_createAccessList");
         Ok(EthCall::create_access_list_at(self, request, block_number, state_override).await?)
     }
