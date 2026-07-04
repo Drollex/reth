@@ -8,7 +8,7 @@ use crate::{
     helpers::estimate::EstimateCall, FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
-use alloy_eips::eip2930::AccessListResult;
+use alloy_eips::eip2930::{AccessList,AccessListResult};
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Bytes, B256, U256};
@@ -46,6 +46,18 @@ use revm::{
 };
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::{trace, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnhancedAccessListResult {
+    #[serde(flatten)]
+    pub base: AccessListResult,
+
+    pub gas_refunded: Option<U256>,
+    pub pre_refund_gas_used: Option<U256>,
+    pub logs: Vec<Log>,
+    pub pending_block: U256,
+}
 
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
@@ -350,7 +362,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
-    ) -> impl Future<Output = Result<AccessListResult, Self::Error>> + Send
+    ) -> impl Future<Output = Result<EnhancedAccessListResult, Self::Error>> + Send
     where
         Self: Trace,
     {
@@ -373,7 +385,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         at: BlockId,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         state_override: Option<StateOverride>,
-    ) -> impl Future<Output = Result<AccessListResult, Self::Error>> + Send
+    ) -> impl Future<Output = Result<EnhancedAccessListResult, Self::Error>> + Send
     where
         Self: Trace,
     {
@@ -407,49 +419,53 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 tx_env.set_gas_limit(cap.min(evm_env.block_env.gas_limit));
             }
 
-            // can consume the list since we're not using the request anymore
-            let initial = request.as_ref().access_list().cloned().unwrap_or_default();
-
-            let mut inspector = AccessListInspector::new(initial);
-
-            let result = this.inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)?;
-            let access_list = inspector.into_access_list();
-            tx_env.set_access_list(access_list.clone());
-            match result.result {
-                ExecutionResult::Halt { reason, gas_used } => {
-                    let error =
-                        Some(Self::Error::from_evm_halt(reason, tx_env.gas_limit()).to_string());
-                    return Ok(AccessListResult {
-                        access_list,
-                        gas_used: U256::from(gas_used),
-                        error,
-                    })
-                }
-                ExecutionResult::Revert { output, gas_used } => {
-                    let error = Some(RevertError::new(output).to_string());
-                    return Ok(AccessListResult {
-                        access_list,
-                        gas_used: U256::from(gas_used),
-                        error,
-                    })
-                }
-                ExecutionResult::Success { .. } => {}
-            };
-
-            // transact again to get the exact gas used
+            // transact to get the exact gas used
             let gas_limit = tx_env.gas_limit();
+            let pending_block = U256::from(evm_env.block_env.number);
             let result = this.transact(&mut db, evm_env, tx_env)?;
             let res = match result.result {
                 ExecutionResult::Halt { reason, gas_used } => {
                     let error = Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
-                    AccessListResult { access_list, gas_used: U256::from(gas_used), error }
+                    EnhancedAccessListResult {
+                        base: AccessListResult {
+                            access_list: AccessList:default(),
+                            gas_used: U256::from(gas_used),
+                            error: None,
+                        },
+                        gas_refunded: None,
+                        pre_refund_gas_used: None,
+                        pending_block,
+                    }
                 }
                 ExecutionResult::Revert { output, gas_used } => {
                     let error = Some(RevertError::new(output).to_string());
-                    AccessListResult { access_list, gas_used: U256::from(gas_used), error }
+                    EnhancedAccessListResult {
+                        base: AccessListResult {
+                            access_list: AccessList:default(),
+                            gas_used: U256::from(gas_used),
+                            error: None,
+                        },
+                        gas_refunded: None,
+                        pre_refund_gas_used: None,
+                        pending_block,
+                    }
                 }
-                ExecutionResult::Success { gas_used, .. } => {
-                    AccessListResult { access_list, gas_used: U256::from(gas_used), error: None }
+                ExecutionResult::Success { gas_used, gas_refunded, logs, .. } => {
+                    let gas_used = U256::from(gas_used);
+                    let gas_refunded = U256::from(gas_refunded);
+                    let pre_refund_gas_used = gas_used + gas_refunded;
+
+                    EnhancedAccessListResult {
+                        base: AccessListResult {
+                            access_list: AccessList:default(),
+                            gas_used,
+                            error: None,
+                        },
+                        gas_refunded: Some(gas_refunded),
+                        pre_refund_gas_used: Some(pre_refund_gas_used),
+                        logs,
+                        pending_block,
+                    }
                 }
             };
 
