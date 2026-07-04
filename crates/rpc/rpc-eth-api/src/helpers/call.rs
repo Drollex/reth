@@ -47,7 +47,7 @@ use revm::{
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::{trace, warn};
 
-use alloy_rpc_types_eth::Log;
+use alloy_primitives::Log;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

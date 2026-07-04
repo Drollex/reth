@@ -55,6 +55,7 @@ parking_lot.workspace = true
 tokio.workspace = true
 
 # misc
+serde = { workspace = true, features = ["derive"] }
 auto_impl.workspace = true
 dyn-clone.workspace = true
 tracing.workspace = true

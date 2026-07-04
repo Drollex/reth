@@ -10194,6 +10194,7 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "revm-inspectors",
+ "serde",
  "tokio",
  "tracing",
 ]
