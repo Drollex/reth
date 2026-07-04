@@ -8,7 +8,7 @@ use crate::{
     helpers::estimate::EstimateCall, FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
-use alloy_eips::eip2930::{AccessList,AccessListResult};
+use alloy_eips::eip2930::{AccessList, AccessListResult};
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Bytes, B256, U256};
@@ -46,6 +46,9 @@ use revm::{
 };
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::{trace, warn};
+
+use alloy_rpc_types_eth::Log;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -428,12 +431,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     let error = Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
                     EnhancedAccessListResult {
                         base: AccessListResult {
-                            access_list: AccessList:default(),
+                            access_list: AccessList::default(),
                             gas_used: U256::from(gas_used),
                             error: None,
                         },
                         gas_refunded: None,
                         pre_refund_gas_used: None,
+                        logs: Vec::new(),
                         pending_block,
                     }
                 }
@@ -441,12 +445,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     let error = Some(RevertError::new(output).to_string());
                     EnhancedAccessListResult {
                         base: AccessListResult {
-                            access_list: AccessList:default(),
+                            access_list: AccessList::default(),
                             gas_used: U256::from(gas_used),
                             error: None,
                         },
                         gas_refunded: None,
                         pre_refund_gas_used: None,
+                        logs: Vec::new(),
                         pending_block,
                     }
                 }
@@ -457,7 +462,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                     EnhancedAccessListResult {
                         base: AccessListResult {
-                            access_list: AccessList:default(),
+                            access_list: AccessList::default(),
                             gas_used,
                             error: None,
                         },
