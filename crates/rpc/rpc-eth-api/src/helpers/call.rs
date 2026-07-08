@@ -64,8 +64,16 @@ use alloy_evm::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HlPrecompileOverrides {
     pub address: Address,
+    pub overrides: Vec<HlPrecompileOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlPrecompileOverride {
     pub input: Bytes,
     pub output: Bytes,
 }
@@ -568,45 +576,55 @@ pub trait Call:
         Ok(res)
     }
     /// doc
-    fn transact_with_precompile_overrides<DB>(
-        &self,
-        db: DB,
-        evm_env: EvmEnvFor<Self::Evm>,
-        tx_env: TxEnvFor<Self::Evm>,
-        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
-    ) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
-    where
-        DB: Database<Error = ProviderError> + fmt::Debug,
-    {
-        let mut evm = self.evm_config().evm_with_env(db, evm_env);
+   fn transact_with_precompile_overrides<DB>(
+    &self,
+    db: DB,
+    evm_env: EvmEnvFor<Self::Evm>,
+    tx_env: TxEnvFor<Self::Evm>,
+    precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
+where
+    DB: Database<Error = ProviderError> + fmt::Debug,
+{
+    let mut evm = self.evm_config().evm_with_env(db, evm_env);
 
-        //let mut precompiles = Precompiles::cancun().clone(); // mega scuffed, keine ahnung wie man die aktuellen einfach bekommt
-        // let mut precompiles = PrecompilesMap::from_static(&Precompiles::cancun());
+    if let Some(overrides) = precompile_overrides {
+        for precompile_override in overrides {
+            let address = precompile_override.address;
+            let address_for_id = address.clone();
+            let override_pairs = precompile_override.overrides;
 
-        if let Some(overrides) = precompile_overrides {
-            for precompile_override in overrides {
-                evm.precompiles_mut().apply_precompile(&precompile_override.address, |_|{
-                    Some(DynPrecompile::new(
-                        PrecompileId::custom(precompile_override.address.to_string()),
-                        move |input| {
-                            if input.data() == precompile_override.input.as_ref() {
-                                Ok(PrecompileOutput::new(
-                                    1000 + 33 * (input.data().len() + precompile_override.output.len()) as u64,
-                                    precompile_override.output.clone(),
-                                ))
-                            } else {
-                                Ok(PrecompileOutput::new_reverted(0, Bytes::new())) // Man sollte hier das ganze gas consumen
-                            }
+            evm.precompiles_mut().apply_precompile(&address, move |_| {
+                Some(DynPrecompile::new(
+                    PrecompileId::custom(address_for_id.to_string()),
+                    move |input| {
+                        if let Some(matching_override) = override_pairs
+                            .iter()
+                            .find(|override_pair| input.data() == override_pair.input.as_ref())
+                        {
+                            Ok(PrecompileOutput::new(
+                                1000
+                                    + 33
+                                        * (
+                                            input.data().len()
+                                                + matching_override.output.len()
+                                        ) as u64,
+                                matching_override.output.clone(),
+                            ))
+                        } else {
+                            // TODO: consume all available gas here if desired
+                            Ok(PrecompileOutput::new_reverted(0, Bytes::new()))
                         }
-                    ))
-                })
-            }
+                    },
+                ))
+            });
         }
-
-        let res = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
-
-        Ok(res)
     }
+
+    let res = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
+
+    Ok(res)
+}
 
     /// Executes the [`EvmEnv`] against the given [Database] without committing state
     /// changes.
