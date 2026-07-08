@@ -47,8 +47,28 @@ use revm::{
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::{trace, warn};
 
-use alloy_primitives::Log;
+use alloy_primitives::{Log,Address};
 use serde::{Serialize, Deserialize};
+
+use alloy_evm::precompiles::{DynPrecompile,PrecompilesMap};
+use revm::precompile::{Precompiles, PrecompileSpecId};
+
+use alloy_evm::{
+    Evm as _,
+    EthEvm,
+    revm::{
+        handler::EthPrecompiles,
+        precompile::{PrecompileId, PrecompileOutput},
+    },
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlPrecompileOverrides {
+    pub address: Address,
+    pub input: Bytes,
+    pub output: Bytes,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -365,6 +385,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> impl Future<Output = Result<EnhancedAccessListResult, Self::Error>> + Send
     where
         Self: Trace,
@@ -374,7 +395,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let (evm_env, at) = self.evm_env_at(block_id).await?;
 
             self.spawn_blocking_io_fut(move |this| async move {
-                this.create_access_list_with(evm_env, at, request, state_override).await
+                this.create_access_list_with(evm_env, at, request, state_override, precompile_overrides).await
             })
             .await
         }
@@ -388,6 +409,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         at: BlockId,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         state_override: Option<StateOverride>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> impl Future<Output = Result<EnhancedAccessListResult, Self::Error>> + Send
     where
         Self: Trace,
@@ -425,7 +447,12 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // transact to get the exact gas used
             let gas_limit = tx_env.gas_limit();
             let pending_block = U256::from(evm_env.block_env.number);
-            let result = this.transact(&mut db, evm_env, tx_env)?;
+
+            let result = this.transact_with_precompile_overrides(&mut db, evm_env, tx_env, precompile_overrides)?;
+
+            //let mut evm = self.evm_config().evm_with_env(db, evm_env);
+            //let result = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
+
             let res = match result.result {
                 ExecutionResult::Halt { reason, gas_used } => {
                     let error = Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
@@ -536,6 +563,46 @@ pub trait Call:
         DB: Database<Error = ProviderError> + fmt::Debug,
     {
         let mut evm = self.evm_config().evm_with_env(db, evm_env);
+        let res = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
+
+        Ok(res)
+    }
+    /// doc
+    fn transact_with_precompile_overrides<DB>(
+        &self,
+        db: DB,
+        evm_env: EvmEnvFor<Self::Evm>,
+        tx_env: TxEnvFor<Self::Evm>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+    ) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
+    where
+        DB: Database<Error = ProviderError> + fmt::Debug,
+    {
+        let mut evm = self.evm_config().evm_with_env(db, evm_env);
+
+        //let mut precompiles = Precompiles::cancun().clone(); // mega scuffed, keine ahnung wie man die aktuellen einfach bekommt
+        // let mut precompiles = PrecompilesMap::from_static(&Precompiles::cancun());
+
+        if let Some(overrides) = precompile_overrides {
+            for precompile_override in overrides {
+                evm.precompiles_mut().apply_precompile(&precompile_override.address, |_|{
+                    Some(DynPrecompile::new(
+                        PrecompileId::custom(precompile_override.address.to_string()),
+                        move |input| {
+                            if input.data() == precompile_override.input.as_ref() {
+                                Ok(PrecompileOutput::new(
+                                    0,
+                                    precompile_override.output.clone(),
+                                ))
+                            } else {
+                                Ok(PrecompileOutput::new_reverted(0, Bytes::new()))
+                            }
+                        }
+                    ))
+                })
+            }
+        }
+
         let res = evm.transact(tx_env).map_err(Self::Error::from_evm_err)?;
 
         Ok(res)

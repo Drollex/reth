@@ -6,7 +6,7 @@ use crate::{
 };
 use alloy_dyn_abi::TypedData;
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use crate::helpers::call::EnhancedAccessListResult;
+use crate::helpers::call::{EnhancedAccessListResult, HlPrecompileOverrides};
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Address, Bytes, B256, B64, U256, U64};
 use alloy_rpc_types_eth::{
@@ -259,6 +259,7 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
         request: TxReq,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> RpcResult<EnhancedAccessListResult>;
 
     /// Generates and returns an estimate of how much gas is necessary to allow the transaction to
@@ -700,9 +701,10 @@ where
         request: RpcTxReq<T::NetworkTypes>,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> RpcResult<EnhancedAccessListResult> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_override, "Serving eth_createAccessList");
-        Ok(EthCall::create_access_list_at(self, request, block_number, state_override).await?)
+        Ok(EthCall::create_access_list_at(self, request, block_number, state_override, precompile_overrides).await?)
     }
 
     /// Handler for: `eth_estimateGas`
