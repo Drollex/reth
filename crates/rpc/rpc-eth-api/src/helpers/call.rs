@@ -591,7 +591,7 @@ pub trait Call:
                         move |input| {
                             if input.data() == precompile_override.input.as_ref() {
                                 Ok(PrecompileOutput::new(
-                                    2000 + 65 * (input.data().len() + precompile_override.output.len()) as u64,
+                                    1000 + 33 * (input.data().len() + precompile_override.output.len()) as u64,
                                     precompile_override.output.clone(),
                                 ))
                             } else {
