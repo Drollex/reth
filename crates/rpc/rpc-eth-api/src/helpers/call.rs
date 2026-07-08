@@ -64,8 +64,6 @@ use alloy_evm::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HlPrecompileOverrides {
     pub address: Address,
     pub overrides: Vec<HlPrecompileOverride>,
