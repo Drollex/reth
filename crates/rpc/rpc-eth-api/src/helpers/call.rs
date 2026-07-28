@@ -466,7 +466,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         base: AccessListResult {
                             access_list: AccessList::default(),
                             gas_used: U256::from(gas_used),
-                            error: None,
+                            error: error,
                         },
                         gas_refunded: None,
                         pre_refund_gas_used: None,
@@ -480,7 +480,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         base: AccessListResult {
                             access_list: AccessList::default(),
                             gas_used: U256::from(gas_used),
-                            error: None,
+                            error: error,
                         },
                         gas_refunded: None,
                         pre_refund_gas_used: None,
