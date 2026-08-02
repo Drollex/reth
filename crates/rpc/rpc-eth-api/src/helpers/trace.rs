@@ -23,6 +23,36 @@ use revm::{context_interface::result::ResultAndState, DatabaseCommit};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
 
+use alloy_primitives::{Log,Address};
+use serde::{Serialize, Deserialize};
+
+use alloy_evm::precompiles::{DynPrecompile,PrecompilesMap};
+use revm::precompile::{Precompiles, PrecompileSpecId};
+
+use alloy_evm::{
+    Evm as _,
+    EthEvm,
+    revm::{
+        handler::EthPrecompiles,
+        precompile::{PrecompileId, PrecompileOutput},
+    },
+};
+use alloy_primitives::{Bytes, U256};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlPrecompileOverrides {
+    pub address: Address,
+    pub overrides: Vec<HlPrecompileOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlPrecompileOverride {
+    pub input: Bytes,
+    pub output: Bytes,
+}
+
 /// Executes CPU heavy tasks.
 pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> {
     /// Executes the [`TxEnvFor`] with [`EvmEnvFor`] against the given [Database] without committing
@@ -39,6 +69,55 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> {
         I: InspectorFor<Self::Evm, DB>,
     {
         let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
+        evm.transact(tx_env).map_err(Self::Error::from_evm_err)
+    }
+
+    fn inspect_with_overrides<DB, I>(
+        &self,
+        db: DB,
+        evm_env: EvmEnvFor<Self::Evm>,
+        tx_env: TxEnvFor<Self::Evm>,
+        inspector: I,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+    ) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
+    where
+        DB: Database<Error = ProviderError>,
+        I: InspectorFor<Self::Evm, DB>,
+    {
+        let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
+
+        if let Some(overrides) = precompile_overrides {
+            for precompile_override in overrides {
+                let address = precompile_override.address;
+                let address_for_id = address.clone();
+                let override_pairs = precompile_override.overrides;
+    
+                evm.precompiles_mut().apply_precompile(&address, move |_| {
+                    Some(DynPrecompile::new(
+                        PrecompileId::custom(address_for_id.to_string()),
+                        move |input| {
+                            if let Some(matching_override) = override_pairs
+                                .iter()
+                                .find(|override_pair| input.data() == override_pair.input.as_ref())
+                            {
+                                Ok(PrecompileOutput::new(
+                                    1000
+                                        + 33
+                                            * (
+                                                input.data().len()
+                                                    + matching_override.output.len()
+                                            ) as u64,
+                                    matching_override.output.clone(),
+                                ))
+                            } else {
+                                // TODO: consume all available gas here if desired
+                                Ok(PrecompileOutput::new_reverted(0, Bytes::new()))
+                            }
+                        },
+                    ))
+                });
+            }
+        }  
         evm.transact(tx_env).map_err(Self::Error::from_evm_err)
     }
 
