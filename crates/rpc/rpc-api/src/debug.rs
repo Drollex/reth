@@ -1,1360 +1,449 @@
-use alloy_consensus::{
-    transaction::{SignerRecoverable, TxHashRef},
-    BlockHeader,
-};
-use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_genesis::ChainConfig;
-use alloy_primitives::{uint, Address, Bytes, B256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_json_rpc::RpcObject;
+use alloy_primitives::{Address, Bytes, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
-use alloy_rpc_types_eth::{
-    state::EvmOverrides, Block as RpcBlock, BlockError, Bundle, StateContext, TransactionInfo,
-};
+use alloy_rpc_types_eth::{Block, Bundle, StateContext};
 use alloy_rpc_types_trace::geth::{
-    call::FlatCallFrame, BlockTraceResult, FourByteFrame, GethDebugBuiltInTracerType,
-    GethDebugTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
-    NoopFrame, TraceResult,
+    BlockTraceResult, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, TraceResult,
 };
-use async_trait::async_trait;
-use jsonrpsee::core::RpcResult;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
-use reth_errors::RethError;
-use reth_evm::{execute::Executor, ConfigureEvm, EvmEnvFor, TxEnvFor};
-use reth_primitives_traits::{Block as _, BlockBody, ReceiptWithBloom, RecoveredBlock};
-use reth_revm::{
-    database::StateProviderDatabase,
-    db::{CacheDB, State},
-    witness::ExecutionWitnessRecord,
-};
-use reth_rpc_api::DebugApiServer;
-use reth_rpc_convert::RpcTxReq;
-use reth_rpc_eth_api::{
-    helpers::{EthTransactions, TraceExt},
-    EthApiTypes, FromEthApiError, RpcNodeCore,
-};
-use reth_rpc_eth_types::{EthApiError, StateCacheDb};
-use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
-use reth_storage_api::{
-    BlockIdReader, BlockReaderIdExt, HeaderProvider, ProviderBlock, ReceiptProviderIdExt,
-    StateProofProvider, StateProviderFactory, StateRootProvider, TransactionVariant,
-};
-use reth_tasks::pool::BlockingTaskGuard;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use reth_rpc_eth_api::helpers::call::HlPrecompileOverrides;
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
-use revm::{context_interface::Transaction, state::EvmState, DatabaseCommit};
-use revm_inspectors::tracing::{
-    FourByteInspector, MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
-};
-use std::sync::Arc;
-use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
-use alloy_primitives::{Log};
-use serde::{Serialize, Deserialize};
-
-use alloy_evm::precompiles::{DynPrecompile,PrecompilesMap};
-use revm::precompile::{Precompiles, PrecompileSpecId};
-
-use alloy_evm::{
-    Evm as _,
-    EthEvm,
-    revm::{
-        handler::EthPrecompiles,
-        precompile::{PrecompileId, PrecompileOutput},
-    },
-};
-use alloy_primitives::{U256};
-
-use reth_rpc_eth_api::helpers::HlPrecompileOverrides;
-
-/// `debug` API implementation.
-///
-/// This type provides the functionality for handling `debug` related requests.
-pub struct DebugApi<Eth> {
-    inner: Arc<DebugApiInner<Eth>>,
-}
-
-// === impl DebugApi ===
-
-impl<Eth> DebugApi<Eth> {
-    /// Create a new instance of the [`DebugApi`]
-    pub fn new(eth_api: Eth, blocking_task_guard: BlockingTaskGuard) -> Self {
-        let inner = Arc::new(DebugApiInner { eth_api, blocking_task_guard });
-        Self { inner }
-    }
-
-    /// Access the underlying `Eth` API.
-    pub fn eth_api(&self) -> &Eth {
-        &self.inner.eth_api
-    }
-}
-
-impl<Eth: RpcNodeCore> DebugApi<Eth> {
-    /// Access the underlying provider.
-    pub fn provider(&self) -> &Eth::Provider {
-        self.inner.eth_api.provider()
-    }
-}
-
-// === impl DebugApi ===
-
-impl<Eth> DebugApi<Eth>
-where
-    Eth: EthApiTypes + TraceExt + 'static,
-{
-    /// Acquires a permit to execute a tracing call.
-    async fn acquire_trace_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
-        self.inner.blocking_task_guard.clone().acquire_owned().await
-    }
-
-    /// Trace the entire block asynchronously
-    async fn trace_block(
-        &self,
-        block: Arc<RecoveredBlock<ProviderBlock<Eth::Provider>>>,
-        evm_env: EvmEnvFor<Eth::Evm>,
-        opts: GethDebugTracingOptions,
-    ) -> Result<Vec<TraceResult>, Eth::Error> {
-        // replay all transactions of the block
-        let this = self.clone();
-        self.eth_api()
-            .spawn_with_state_at_block(block.parent_hash().into(), move |state| {
-                let mut results = Vec::with_capacity(block.body().transactions().len());
-                let mut db = CacheDB::new(StateProviderDatabase::new(state));
-
-                this.eth_api().apply_pre_execution_changes(&block, &mut db, &evm_env)?;
-
-                let mut transactions = block.transactions_recovered().enumerate().peekable();
-                let mut inspector = None;
-                while let Some((index, tx)) = transactions.next() {
-                    let tx_hash = *tx.tx_hash();
-
-                    let tx_env = this.eth_api().evm_config().tx_env(tx);
-
-                    let (result, state_changes) = this.trace_transaction(
-                        &opts,
-                        evm_env.clone(),
-                        tx_env,
-                        &mut db,
-                        Some(TransactionContext {
-                            block_hash: Some(block.hash()),
-                            tx_hash: Some(tx_hash),
-                            tx_index: Some(index),
-                        }),
-                        &mut inspector,
-                    )?;
-
-                    inspector = inspector.map(|insp| insp.fused());
-
-                    results.push(TraceResult::Success { result, tx_hash: Some(tx_hash) });
-                    if transactions.peek().is_some() {
-                        // need to apply the state changes of this transaction before executing the
-                        // next transaction
-                        db.commit(state_changes)
-                    }
-                }
-
-                Ok(results)
-            })
-            .await
-    }
-
-    /// Replays the given block and returns the trace of each transaction.
-    ///
-    /// This expects a rlp encoded block
-    ///
-    /// Note, the parent of this block must be present, or it will fail.
-    pub async fn debug_trace_raw_block(
-        &self,
-        rlp_block: Bytes,
-        opts: GethDebugTracingOptions,
-    ) -> Result<Vec<TraceResult>, Eth::Error> {
-        let block: ProviderBlock<Eth::Provider> = Decodable::decode(&mut rlp_block.as_ref())
-            .map_err(BlockError::RlpDecodeRawBlock)
-            .map_err(Eth::Error::from_eth_err)?;
-
-        let evm_env = self
-            .eth_api()
-            .evm_config()
-            .evm_env(block.header())
-            .map_err(RethError::other)
-            .map_err(Eth::Error::from_eth_err)?;
-
-        // Depending on EIP-2 we need to recover the transactions differently
-        let senders =
-            if self.provider().chain_spec().is_homestead_active_at_block(block.header().number()) {
-                block
-                    .body()
-                    .transactions()
-                    .iter()
-                    .map(|tx| tx.recover_signer().map_err(Eth::Error::from_eth_err))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .collect()
-            } else {
-                block
-                    .body()
-                    .transactions()
-                    .iter()
-                    .map(|tx| tx.recover_signer_unchecked().map_err(Eth::Error::from_eth_err))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .collect()
-            };
-
-        self.trace_block(Arc::new(block.into_recovered_with_signers(senders)), evm_env, opts).await
-    }
-
-    /// Replays a block and returns the trace of each transaction.
-    pub async fn debug_trace_block(
-        &self,
-        block_id: BlockId,
-        opts: GethDebugTracingOptions,
-    ) -> Result<Vec<TraceResult>, Eth::Error> {
-        let block_hash = self
-            .provider()
-            .block_hash_for_id(block_id)
-            .map_err(Eth::Error::from_eth_err)?
-            .ok_or(EthApiError::HeaderNotFound(block_id))?;
-
-        let ((evm_env, _), block) = futures::try_join!(
-            self.eth_api().evm_env_at(block_hash.into()),
-            self.eth_api().recovered_block(block_hash.into()),
-        )?;
-
-        let block = block.ok_or(EthApiError::HeaderNotFound(block_id))?;
-
-        self.trace_block(block, evm_env, opts).await
-    }
-
-    /// Trace the transaction according to the provided options.
-    ///
-    /// Ref: <https://geth.ethereum.org/docs/developers/evm-tracing/built-in-tracers>
-    pub async fn debug_trace_transaction(
-        &self,
-        tx_hash: B256,
-        opts: GethDebugTracingOptions,
-    ) -> Result<GethTrace, Eth::Error> {
-        let (transaction, block) = match self.eth_api().transaction_and_block(tx_hash).await? {
-            None => return Err(EthApiError::TransactionNotFound.into()),
-            Some(res) => res,
-        };
-        let (evm_env, _) = self.eth_api().evm_env_at(block.hash().into()).await?;
-
-        // we need to get the state of the parent block because we're essentially replaying the
-        // block the transaction is included in
-        let state_at: BlockId = block.parent_hash().into();
-        let block_hash = block.hash();
-
-        let this = self.clone();
-        self.eth_api()
-            .spawn_with_state_at_block(state_at, move |state| {
-                let block_txs = block.transactions_recovered();
-
-                // configure env for the target transaction
-                let tx = transaction.into_recovered();
-
-                let mut db = CacheDB::new(StateProviderDatabase::new(state));
-
-                this.eth_api().apply_pre_execution_changes(&block, &mut db, &evm_env)?;
-
-                // replay all transactions prior to the targeted transaction
-                let index = this.eth_api().replay_transactions_until(
-                    &mut db,
-                    evm_env.clone(),
-                    block_txs,
-                    *tx.tx_hash(),
-                )?;
-
-                let tx_env = this.eth_api().evm_config().tx_env(&tx);
-
-                this.trace_transaction(
-                    &opts,
-                    evm_env,
-                    tx_env,
-                    &mut db,
-                    Some(TransactionContext {
-                        block_hash: Some(block_hash),
-                        tx_index: Some(index),
-                        tx_hash: Some(*tx.tx_hash()),
-                    }),
-                    &mut None,
-                )
-                .map(|(trace, _)| trace)
-            })
-            .await
-    }
-
-    /// The `debug_traceCall` method lets you run an `eth_call` within the context of the given
-    /// block execution using the final state of parent block as the base.
-    ///
-    /// Differences compare to `eth_call`:
-    ///  - `debug_traceCall` executes with __enabled__ basefee check, `eth_call` does not: <https://github.com/paradigmxyz/reth/issues/6240>
-    pub async fn debug_trace_call(
-        &self,
-        call: RpcTxReq<Eth::NetworkTypes>,
-        block_id: Option<BlockId>,
-        opts: GethDebugTracingCallOptions,
-        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
-    ) -> Result<GethTrace, Eth::Error> {
-        let at = block_id.unwrap_or_default();
-        let GethDebugTracingCallOptions {
-            tracing_options, state_overrides, block_overrides, ..
-        } = opts;
-        let overrides = EvmOverrides::new(state_overrides, block_overrides.map(Box::new));
-        let GethDebugTracingOptions { config, tracer, tracer_config, .. } = tracing_options;
-
-        let this = self.clone();
-        if let Some(tracer) = tracer {
-            #[allow(unreachable_patterns)]
-            return match tracer {
-                GethDebugTracerType::BuiltInTracer(tracer) => match tracer {
-                    GethDebugBuiltInTracerType::FourByteTracer => {
-                        let mut inspector = FourByteInspector::default();
-                        let inspector = self
-                            .eth_api()
-                            .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                                this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides.clone())?;
-                                Ok(inspector)
-                            })
-                            .await?;
-                        Ok(FourByteFrame::from(&inspector).into())
-                    }
-                    GethDebugBuiltInTracerType::CallTracer => {
-                        let call_config = tracer_config
-                            .into_call_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = TracingInspector::new(
-                            TracingInspectorConfig::from_geth_call_config(&call_config),
-                        );
-
-                        let frame = self
-                            .eth_api()
-                            .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                                let gas_limit = tx_env.gas_limit();
-                                let res =
-                                    this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides.clone())?;
-                                let frame = inspector
-                                    .with_transaction_gas_limit(gas_limit)
-                                    .into_geth_builder()
-                                    .geth_call_traces(call_config, res.result.gas_used());
-                                Ok(frame.into())
-                            })
-                            .await?;
-                        Ok(frame)
-                    }
-                    GethDebugBuiltInTracerType::PreStateTracer => {
-                        let prestate_config = tracer_config
-                            .into_pre_state_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-                        let mut inspector = TracingInspector::new(
-                            TracingInspectorConfig::from_geth_prestate_config(&prestate_config),
-                        );
-
-                        let frame = self
-                            .eth_api()
-                            .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                                // wrapper is hack to get around 'higher-ranked lifetime error',
-                                // see <https://github.com/rust-lang/rust/issues/100013>
-                                let db = db.0;
-
-                                let gas_limit = tx_env.gas_limit();
-                                let res = this.eth_api().inspect_with_overrides(
-                                    &mut *db,
-                                    evm_env,
-                                    tx_env,
-                                    &mut inspector,
-                                    precompile_overrides.clone(),
-                                )?;
-                                let frame = inspector
-                                    .with_transaction_gas_limit(gas_limit)
-                                    .into_geth_builder()
-                                    .geth_prestate_traces(&res, &prestate_config, db)
-                                    .map_err(Eth::Error::from_eth_err)?;
-                                Ok(frame)
-                            })
-                            .await?;
-                        Ok(frame.into())
-                    }
-                    GethDebugBuiltInTracerType::NoopTracer => Ok(NoopFrame::default().into()),
-                    GethDebugBuiltInTracerType::MuxTracer => {
-                        let mux_config = tracer_config
-                            .into_mux_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = MuxInspector::try_from_config(mux_config)
-                            .map_err(Eth::Error::from_eth_err)?;
-
-                        let frame = self
-                            .inner
-                            .eth_api
-                            .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                                // wrapper is hack to get around 'higher-ranked lifetime error', see
-                                // <https://github.com/rust-lang/rust/issues/100013>
-                                let db = db.0;
-
-                                let tx_info = TransactionInfo {
-                                    block_number: Some(evm_env.block_env.number.saturating_to()),
-                                    base_fee: Some(evm_env.block_env.basefee),
-                                    hash: None,
-                                    block_hash: None,
-                                    index: None,
-                                };
-
-                                let res = this.eth_api().inspect_with_overrides(
-                                    &mut *db,
-                                    evm_env,
-                                    tx_env,
-                                    &mut inspector,
-                                    precompile_overrides.clone(),
-                                )?;
-                                let frame = inspector
-                                    .try_into_mux_frame(&res, db, tx_info)
-                                    .map_err(Eth::Error::from_eth_err)?;
-                                Ok(frame.into())
-                            })
-                            .await?;
-                        Ok(frame)
-                    }
-                    GethDebugBuiltInTracerType::FlatCallTracer => {
-                        let flat_call_config = tracer_config
-                            .into_flat_call_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = TracingInspector::new(
-                            TracingInspectorConfig::from_flat_call_config(&flat_call_config),
-                        );
-
-                        let frame: FlatCallFrame = self
-                            .inner
-                            .eth_api
-                            .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                                let gas_limit = tx_env.gas_limit();
-                                this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides.clone())?;
-                                let tx_info = TransactionInfo::default();
-                                let frame: FlatCallFrame = inspector
-                                    .with_transaction_gas_limit(gas_limit)
-                                    .into_parity_builder()
-                                    .into_localized_transaction_traces(tx_info);
-                                Ok(frame)
-                            })
-                            .await?;
-
-                        Ok(frame.into())
-                    }
-                },
-                #[cfg(not(feature = "js-tracer"))]
-                GethDebugTracerType::JsTracer(_) => {
-                    Err(EthApiError::Unsupported("JS Tracer is not enabled").into())
-                }
-                #[cfg(feature = "js-tracer")]
-                GethDebugTracerType::JsTracer(code) => {
-                    let config = tracer_config.into_json();
-
-                    let (_, at) = self.eth_api().evm_env_at(at).await?;
-
-                    let res = self
-                        .eth_api()
-                        .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                            // wrapper is hack to get around 'higher-ranked lifetime error', see
-                            // <https://github.com/rust-lang/rust/issues/100013>
-                            let db = db.0;
-
-                            let mut inspector =
-                                revm_inspectors::tracing::js::JsInspector::new(code, config)
-                                    .map_err(Eth::Error::from_eth_err)?;
-                            let res = this.eth_api().inspect_with_overrides(
-                                &mut *db,
-                                evm_env.clone(),
-                                tx_env.clone(),
-                                &mut inspector,
-                                precompile_overrides.clone(),
-                            )?;
-                            inspector
-                                .json_result(res, &tx_env, &evm_env.block_env, db)
-                                .map_err(Eth::Error::from_eth_err)
-                        })
-                        .await?;
-
-                    Ok(GethTrace::JS(res))
-                }
-                _ => {
-                    // Note: this match is non-exhaustive in case we need to add support for
-                    // additional tracers
-                    Err(EthApiError::Unsupported("unsupported tracer").into())
-                }
-            }
-        }
-
-        // default structlog tracer
-        let inspector_config = TracingInspectorConfig::from_geth_config(&config);
-
-        let mut inspector = TracingInspector::new(inspector_config);
-
-        let (res, tx_gas_limit, inspector) = self
-            .eth_api()
-            .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                let gas_limit = tx_env.gas_limit();
-                let res = this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides)?;
-                Ok((res, gas_limit, inspector))
-            })
-            .await?;
-        let gas_used = res.result.gas_used();
-        let return_value = res.result.into_output().unwrap_or_default();
-        let frame = inspector
-            .with_transaction_gas_limit(tx_gas_limit)
-            .into_geth_builder()
-            .geth_traces(gas_used, return_value, config);
-
-        Ok(frame.into())
-    }
-
-    /// The `debug_traceCallMany` method lets you run an `eth_callMany` within the context of the
-    /// given block execution using the first n transactions in the given block as base.
-    /// Each following bundle increments block number by 1 and block timestamp by 12 seconds
-    pub async fn debug_trace_call_many(
-        &self,
-        bundles: Vec<Bundle<RpcTxReq<Eth::NetworkTypes>>>,
-        state_context: Option<StateContext>,
-        opts: Option<GethDebugTracingCallOptions>,
-    ) -> Result<Vec<Vec<GethTrace>>, Eth::Error> {
-        if bundles.is_empty() {
-            return Err(EthApiError::InvalidParams(String::from("bundles are empty.")).into())
-        }
-
-        let StateContext { transaction_index, block_number } = state_context.unwrap_or_default();
-        let transaction_index = transaction_index.unwrap_or_default();
-
-        let target_block = block_number.unwrap_or_default();
-        let ((mut evm_env, _), block) = futures::try_join!(
-            self.eth_api().evm_env_at(target_block),
-            self.eth_api().recovered_block(target_block),
-        )?;
-
-        let opts = opts.unwrap_or_default();
-        let block = block.ok_or(EthApiError::HeaderNotFound(target_block))?;
-        let GethDebugTracingCallOptions { tracing_options, mut state_overrides, .. } = opts;
-
-        // we're essentially replaying the transactions in the block here, hence we need the state
-        // that points to the beginning of the block, which is the state at the parent block
-        let mut at = block.parent_hash();
-        let mut replay_block_txs = true;
-
-        // if a transaction index is provided, we need to replay the transactions until the index
-        let num_txs =
-            transaction_index.index().unwrap_or_else(|| block.body().transactions().len());
-        // but if all transactions are to be replayed, we can use the state at the block itself
-        // this works with the exception of the PENDING block, because its state might not exist if
-        // built locally
-        if !target_block.is_pending() && num_txs == block.body().transactions().len() {
-            at = block.hash();
-            replay_block_txs = false;
-        }
-
-        let this = self.clone();
-
-        self.eth_api()
-            .spawn_with_state_at_block(at.into(), move |state| {
-                // the outer vec for the bundles
-                let mut all_bundles = Vec::with_capacity(bundles.len());
-                let mut db = CacheDB::new(StateProviderDatabase::new(state));
-
-                if replay_block_txs {
-                    // only need to replay the transactions in the block if not all transactions are
-                    // to be replayed
-                    let transactions = block.transactions_recovered().take(num_txs);
-
-                    // Execute all transactions until index
-                    for tx in transactions {
-                        let tx_env = this.eth_api().evm_config().tx_env(tx);
-                        let res = this.eth_api().transact(&mut db, evm_env.clone(), tx_env)?;
-                        db.commit(res.state);
-                    }
-                }
-
-                // Trace all bundles
-                let mut bundles = bundles.into_iter().peekable();
-                while let Some(bundle) = bundles.next() {
-                    let mut results = Vec::with_capacity(bundle.transactions.len());
-                    let Bundle { transactions, block_override } = bundle;
-
-                    let block_overrides = block_override.map(Box::new);
-                    let mut inspector = None;
-
-                    let mut transactions = transactions.into_iter().peekable();
-                    while let Some(tx) = transactions.next() {
-                        // apply state overrides only once, before the first transaction
-                        let state_overrides = state_overrides.take();
-                        let overrides = EvmOverrides::new(state_overrides, block_overrides.clone());
-
-                        let (evm_env, tx_env) = this.eth_api().prepare_call_env(
-                            evm_env.clone(),
-                            tx,
-                            &mut db,
-                            overrides,
-                        )?;
-
-                        let (trace, state) = this.trace_transaction(
-                            &tracing_options,
-                            evm_env,
-                            tx_env,
-                            &mut db,
-                            None,
-                            &mut inspector,
-                        )?;
-
-                        inspector = inspector.map(|insp| insp.fused());
-
-                        // If there is more transactions, commit the database
-                        // If there is no transactions, but more bundles, commit to the database too
-                        if transactions.peek().is_some() || bundles.peek().is_some() {
-                            db.commit(state);
-                        }
-                        results.push(trace);
-                    }
-                    // Increment block_env number and timestamp for the next bundle
-                    evm_env.block_env.number += uint!(1_U256);
-                    evm_env.block_env.timestamp += uint!(12_U256);
-
-                    all_bundles.push(results);
-                }
-                Ok(all_bundles)
-            })
-            .await
-    }
-
-    /// Generates an execution witness for the given block hash. see
-    /// [`Self::debug_execution_witness`] for more info.
-    pub async fn debug_execution_witness_by_block_hash(
-        &self,
-        hash: B256,
-    ) -> Result<ExecutionWitness, Eth::Error> {
-        let this = self.clone();
-        let block = this
-            .eth_api()
-            .recovered_block(hash.into())
-            .await?
-            .ok_or(EthApiError::HeaderNotFound(hash.into()))?;
-
-        self.debug_execution_witness_for_block(block).await
-    }
-
-    /// The `debug_executionWitness` method allows for re-execution of a block with the purpose of
-    /// generating an execution witness. The witness comprises of a map of all hashed trie nodes to
-    /// their preimages that were required during the execution of the block, including during state
-    /// root recomputation.
-    pub async fn debug_execution_witness(
-        &self,
-        block_id: BlockNumberOrTag,
-    ) -> Result<ExecutionWitness, Eth::Error> {
-        let this = self.clone();
-        let block = this
-            .eth_api()
-            .recovered_block(block_id.into())
-            .await?
-            .ok_or(EthApiError::HeaderNotFound(block_id.into()))?;
-
-        self.debug_execution_witness_for_block(block).await
-    }
-
-    /// Generates an execution witness, using the given recovered block.
-    pub async fn debug_execution_witness_for_block(
-        &self,
-        block: Arc<RecoveredBlock<ProviderBlock<Eth::Provider>>>,
-    ) -> Result<ExecutionWitness, Eth::Error> {
-        let this = self.clone();
-        let block_number = block.header().number();
-
-        let (mut exec_witness, lowest_block_number) = self
-            .eth_api()
-            .spawn_with_state_at_block(block.parent_hash().into(), move |state_provider| {
-                let db = StateProviderDatabase::new(&state_provider);
-                let block_executor = this.eth_api().evm_config().executor(db);
-
-                let mut witness_record = ExecutionWitnessRecord::default();
-
-                let _ = block_executor
-                    .execute_with_state_closure(&block, |statedb: &State<_>| {
-                        witness_record.record_executed_state(statedb);
-                    })
-                    .map_err(|err| EthApiError::Internal(err.into()))?;
-
-                let ExecutionWitnessRecord { hashed_state, codes, keys, lowest_block_number } =
-                    witness_record;
-
-                let state = state_provider
-                    .witness(Default::default(), hashed_state)
-                    .map_err(EthApiError::from)?;
-                Ok((
-                    ExecutionWitness { state, codes, keys, ..Default::default() },
-                    lowest_block_number,
-                ))
-            })
-            .await?;
-
-        let smallest = match lowest_block_number {
-            Some(smallest) => smallest,
-            None => {
-                // Return only the parent header, if there were no calls to the
-                // BLOCKHASH opcode.
-                block_number.saturating_sub(1)
-            }
-        };
-
-        let range = smallest..block_number;
-        exec_witness.headers = self
-            .provider()
-            .headers_range(range)
-            .map_err(EthApiError::from)?
-            .into_iter()
-            .map(|header| {
-                let mut serialized_header = Vec::new();
-                header.encode(&mut serialized_header);
-                serialized_header.into()
-            })
-            .collect();
-
-        Ok(exec_witness)
-    }
-
-    /// Returns the code associated with a given hash at the specified block ID. If no code is
-    /// found, it returns None. If no block ID is provided, it defaults to the latest block.
-    pub async fn debug_code_by_hash(
-        &self,
-        hash: B256,
-        block_id: Option<BlockId>,
-    ) -> Result<Option<Bytes>, Eth::Error> {
-        Ok(self
-            .provider()
-            .state_by_block_id(block_id.unwrap_or_default())
-            .map_err(Eth::Error::from_eth_err)?
-            .bytecode_by_hash(&hash)
-            .map_err(Eth::Error::from_eth_err)?
-            .map(|b| b.original_bytes()))
-    }
-
-    /// Executes the configured transaction with the environment on the given database.
-    ///
-    /// It optionally takes fused inspector ([`TracingInspector::fused`]) to avoid re-creating the
-    /// inspector for each transaction. This is useful when tracing multiple transactions in a
-    /// block. This is only useful for block tracing which uses the same tracer for all transactions
-    /// in the block.
-    ///
-    /// Caution: If the inspector is provided then `opts.tracer_config` is ignored.
-    ///
-    /// Returns the trace frame and the state that got updated after executing the transaction.
-    ///
-    /// Note: this does not apply any state overrides if they're configured in the `opts`.
-    ///
-    /// Caution: this is blocking and should be performed on a blocking task.
-    fn trace_transaction(
-        &self,
-        opts: &GethDebugTracingOptions,
-        evm_env: EvmEnvFor<Eth::Evm>,
-        tx_env: TxEnvFor<Eth::Evm>,
-        db: &mut StateCacheDb<'_>,
-        transaction_context: Option<TransactionContext>,
-        fused_inspector: &mut Option<TracingInspector>,
-    ) -> Result<(GethTrace, EvmState), Eth::Error> {
-        let GethDebugTracingOptions { config, tracer, tracer_config, .. } = opts;
-
-        let tx_info = TransactionInfo {
-            hash: transaction_context.as_ref().map(|c| c.tx_hash).unwrap_or_default(),
-            index: transaction_context
-                .as_ref()
-                .map(|c| c.tx_index.map(|i| i as u64))
-                .unwrap_or_default(),
-            block_hash: transaction_context.as_ref().map(|c| c.block_hash).unwrap_or_default(),
-            block_number: Some(evm_env.block_env.number.saturating_to()),
-            base_fee: Some(evm_env.block_env.basefee),
-        };
-
-        if let Some(tracer) = tracer {
-            #[allow(unreachable_patterns)]
-            return match tracer {
-                GethDebugTracerType::BuiltInTracer(tracer) => match tracer {
-                    GethDebugBuiltInTracerType::FourByteTracer => {
-                        let mut inspector = FourByteInspector::default();
-                        let res = self.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
-                        return Ok((FourByteFrame::from(&inspector).into(), res.state))
-                    }
-                    GethDebugBuiltInTracerType::CallTracer => {
-                        let call_config = tracer_config
-                            .clone()
-                            .into_call_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = fused_inspector.get_or_insert_with(|| {
-                            TracingInspector::new(TracingInspectorConfig::from_geth_call_config(
-                                &call_config,
-                            ))
-                        });
-
-                        let gas_limit = tx_env.gas_limit();
-                        let res = self.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
-
-                        inspector.set_transaction_gas_limit(gas_limit);
-
-                        let frame = inspector
-                            .geth_builder()
-                            .geth_call_traces(call_config, res.result.gas_used());
-
-                        return Ok((frame.into(), res.state))
-                    }
-                    GethDebugBuiltInTracerType::PreStateTracer => {
-                        let prestate_config = tracer_config
-                            .clone()
-                            .into_pre_state_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = fused_inspector.get_or_insert_with(|| {
-                            TracingInspector::new(
-                                TracingInspectorConfig::from_geth_prestate_config(&prestate_config),
-                            )
-                        });
-                        let gas_limit = tx_env.gas_limit();
-                        let res =
-                            self.eth_api().inspect(&mut *db, evm_env, tx_env, &mut inspector)?;
-
-                        inspector.set_transaction_gas_limit(gas_limit);
-                        let frame = inspector
-                            .geth_builder()
-                            .geth_prestate_traces(&res, &prestate_config, db)
-                            .map_err(Eth::Error::from_eth_err)?;
-
-                        return Ok((frame.into(), res.state))
-                    }
-                    GethDebugBuiltInTracerType::NoopTracer => {
-                        Ok((NoopFrame::default().into(), Default::default()))
-                    }
-                    GethDebugBuiltInTracerType::MuxTracer => {
-                        let mux_config = tracer_config
-                            .clone()
-                            .into_mux_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = MuxInspector::try_from_config(mux_config)
-                            .map_err(Eth::Error::from_eth_err)?;
-
-                        let res =
-                            self.eth_api().inspect(&mut *db, evm_env, tx_env, &mut inspector)?;
-                        let frame = inspector
-                            .try_into_mux_frame(&res, db, tx_info)
-                            .map_err(Eth::Error::from_eth_err)?;
-                        return Ok((frame.into(), res.state))
-                    }
-                    GethDebugBuiltInTracerType::FlatCallTracer => {
-                        let flat_call_config = tracer_config
-                            .clone()
-                            .into_flat_call_config()
-                            .map_err(|_| EthApiError::InvalidTracerConfig)?;
-
-                        let mut inspector = TracingInspector::new(
-                            TracingInspectorConfig::from_flat_call_config(&flat_call_config),
-                        );
-
-                        let gas_limit = tx_env.gas_limit();
-                        let res = self.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
-                        let frame: FlatCallFrame = inspector
-                            .with_transaction_gas_limit(gas_limit)
-                            .into_parity_builder()
-                            .into_localized_transaction_traces(tx_info);
-
-                        return Ok((frame.into(), res.state));
-                    }
-                },
-                #[cfg(not(feature = "js-tracer"))]
-                GethDebugTracerType::JsTracer(_) => {
-                    Err(EthApiError::Unsupported("JS Tracer is not enabled").into())
-                }
-                #[cfg(feature = "js-tracer")]
-                GethDebugTracerType::JsTracer(code) => {
-                    let config = tracer_config.clone().into_json();
-                    let mut inspector =
-                        revm_inspectors::tracing::js::JsInspector::with_transaction_context(
-                            code.clone(),
-                            config,
-                            transaction_context.unwrap_or_default(),
-                        )
-                        .map_err(Eth::Error::from_eth_err)?;
-                    let res = self.eth_api().inspect(
-                        &mut *db,
-                        evm_env.clone(),
-                        tx_env.clone(),
-                        &mut inspector,
-                    )?;
-
-                    let state = res.state.clone();
-                    let result = inspector
-                        .json_result(res, &tx_env, &evm_env.block_env, db)
-                        .map_err(Eth::Error::from_eth_err)?;
-                    Ok((GethTrace::JS(result), state))
-                }
-                _ => {
-                    // Note: this match is non-exhaustive in case we need to add support for
-                    // additional tracers
-                    Err(EthApiError::Unsupported("unsupported tracer").into())
-                }
-            }
-        }
-
-        // default structlog tracer
-        let mut inspector = fused_inspector.get_or_insert_with(|| {
-            let inspector_config = TracingInspectorConfig::from_geth_config(config);
-            TracingInspector::new(inspector_config)
-        });
-        let gas_limit = tx_env.gas_limit();
-        let res = self.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
-        let gas_used = res.result.gas_used();
-        let return_value = res.result.into_output().unwrap_or_default();
-        inspector.set_transaction_gas_limit(gas_limit);
-        let frame = inspector.geth_builder().geth_traces(gas_used, return_value, *config);
-
-        Ok((frame.into(), res.state))
-    }
-
-    /// Returns the state root of the `HashedPostState` on top of the state for the given block with
-    /// trie updates.
-    async fn debug_state_root_with_updates(
-        &self,
-        hashed_state: HashedPostState,
-        block_id: Option<BlockId>,
-    ) -> Result<(B256, TrieUpdates), Eth::Error> {
-        self.inner
-            .eth_api
-            .spawn_blocking_io(move |this| {
-                let state = this
-                    .provider()
-                    .state_by_block_id(block_id.unwrap_or_default())
-                    .map_err(Eth::Error::from_eth_err)?;
-                state.state_root_with_updates(hashed_state).map_err(Eth::Error::from_eth_err)
-            })
-            .await
-    }
-}
-
-#[async_trait]
-impl<Eth> DebugApiServer<RpcTxReq<Eth::NetworkTypes>> for DebugApi<Eth>
-where
-    Eth: EthApiTypes + EthTransactions + TraceExt + 'static,
-{
-    /// Handler for `debug_getRawHeader`
-    async fn raw_header(&self, block_id: BlockId) -> RpcResult<Bytes> {
-        let header = match block_id {
-            BlockId::Hash(hash) => self.provider().header(&hash.into()).to_rpc_result()?,
-            BlockId::Number(number_or_tag) => {
-                let number = self
-                    .provider()
-                    .convert_block_number(number_or_tag)
-                    .to_rpc_result()?
-                    .ok_or_else(|| {
-                    internal_rpc_err("Pending block not supported".to_string())
-                })?;
-                self.provider().header_by_number(number).to_rpc_result()?
-            }
-        };
-
-        let mut res = Vec::new();
-        if let Some(header) = header {
-            header.encode(&mut res);
-        }
-
-        Ok(res.into())
-    }
-
-    /// Handler for `debug_getRawBlock`
-    async fn raw_block(&self, block_id: BlockId) -> RpcResult<Bytes> {
-        let block = self
-            .provider()
-            .block_by_id(block_id)
-            .to_rpc_result()?
-            .ok_or(EthApiError::HeaderNotFound(block_id))?;
-        let mut res = Vec::new();
-        block.encode(&mut res);
-        Ok(res.into())
-    }
-
-    /// Handler for `debug_getRawTransaction`
+/// Debug rpc interface.
+#[cfg_attr(not(feature = "client"), rpc(server, namespace = "debug"))]
+#[cfg_attr(feature = "client", rpc(server, client, namespace = "debug"))]
+pub trait DebugApi<TxReq: RpcObject> {
+    /// Returns an RLP-encoded header.
+    #[method(name = "getRawHeader")]
+    async fn raw_header(&self, block_id: BlockId) -> RpcResult<Bytes>;
+
+    /// Returns an RLP-encoded block.
+    #[method(name = "getRawBlock")]
+    async fn raw_block(&self, block_id: BlockId) -> RpcResult<Bytes>;
+
+    /// Returns a EIP-2718 binary-encoded transaction.
     ///
     /// If this is a pooled EIP-4844 transaction, the blob sidecar is included.
-    ///
-    /// Returns the bytes of the transaction for the given hash.
-    async fn raw_transaction(&self, hash: B256) -> RpcResult<Option<Bytes>> {
-        self.eth_api().raw_transaction_by_hash(hash).await.map_err(Into::into)
-    }
+    #[method(name = "getRawTransaction")]
+    async fn raw_transaction(&self, hash: B256) -> RpcResult<Option<Bytes>>;
 
-    /// Handler for `debug_getRawTransactions`
-    /// Returns the bytes of the transaction for the given hash.
-    async fn raw_transactions(&self, block_id: BlockId) -> RpcResult<Vec<Bytes>> {
-        let block = self
-            .provider()
-            .block_with_senders_by_id(block_id, TransactionVariant::NoHash)
-            .to_rpc_result()?
-            .unwrap_or_default();
-        Ok(block.into_transactions_recovered().map(|tx| tx.encoded_2718().into()).collect())
-    }
+    /// Returns an array of EIP-2718 binary-encoded transactions for the given [`BlockId`].
+    #[method(name = "getRawTransactions")]
+    async fn raw_transactions(&self, block_id: BlockId) -> RpcResult<Vec<Bytes>>;
 
-    /// Handler for `debug_getRawReceipts`
-    async fn raw_receipts(&self, block_id: BlockId) -> RpcResult<Vec<Bytes>> {
-        Ok(self
-            .provider()
-            .receipts_by_block_id(block_id)
-            .to_rpc_result()?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|receipt| ReceiptWithBloom::from(receipt).encoded_2718().into())
-            .collect())
-    }
+    /// Returns an array of EIP-2718 binary-encoded receipts.
+    #[method(name = "getRawReceipts")]
+    async fn raw_receipts(&self, block_id: BlockId) -> RpcResult<Vec<Bytes>>;
 
-    /// Handler for `debug_getBadBlocks`
-    async fn bad_blocks(&self) -> RpcResult<Vec<RpcBlock>> {
-        Ok(vec![])
-    }
+    /// Returns an array of recent bad blocks that the client has seen on the network.
+    #[method(name = "getBadBlocks")]
+    async fn bad_blocks(&self) -> RpcResult<Vec<Block>>;
 
-    /// Handler for `debug_traceChain`
+    /// Returns the structured logs created during the execution of EVM between two blocks
+    /// (excluding start) as a JSON object.
+    #[method(name = "traceChain")]
     async fn debug_trace_chain(
         &self,
-        _start_exclusive: BlockNumberOrTag,
-        _end_inclusive: BlockNumberOrTag,
-    ) -> RpcResult<Vec<BlockTraceResult>> {
-        Err(internal_rpc_err("unimplemented"))
-    }
+        start_exclusive: BlockNumberOrTag,
+        end_inclusive: BlockNumberOrTag,
+    ) -> RpcResult<Vec<BlockTraceResult>>;
 
-    /// Handler for `debug_traceBlock`
+    /// The `debug_traceBlock` method will return a full stack trace of all invoked opcodes of all
+    /// transaction that were included in this block.
+    ///
+    /// This expects an rlp encoded block
+    ///
+    /// Note, the parent of this block must be present, or it will fail. For the second parameter
+    /// see [`GethDebugTracingOptions`] reference.
+    #[method(name = "traceBlock")]
     async fn debug_trace_block(
         &self,
         rlp_block: Bytes,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<Vec<TraceResult>> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_raw_block(self, rlp_block, opts.unwrap_or_default())
-            .await
-            .map_err(Into::into)
-    }
+    ) -> RpcResult<Vec<TraceResult>>;
 
-    /// Handler for `debug_traceBlockByHash`
+    /// Similar to `debug_traceBlock`, `debug_traceBlockByHash` accepts a block hash and will replay
+    /// the block that is already present in the database. For the second parameter see
+    /// [`GethDebugTracingOptions`].
+    #[method(name = "traceBlockByHash")]
     async fn debug_trace_block_by_hash(
         &self,
         block: B256,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<Vec<TraceResult>> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_block(self, block.into(), opts.unwrap_or_default())
-            .await
-            .map_err(Into::into)
-    }
+    ) -> RpcResult<Vec<TraceResult>>;
 
-    /// Handler for `debug_traceBlockByNumber`
+    /// Similar to `debug_traceBlockByHash`, `debug_traceBlockByNumber` accepts a block number
+    /// [`BlockNumberOrTag`] and will replay the block that is already present in the database.
+    /// For the second parameter see [`GethDebugTracingOptions`].
+    #[method(name = "traceBlockByNumber")]
     async fn debug_trace_block_by_number(
         &self,
         block: BlockNumberOrTag,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<Vec<TraceResult>> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_block(self, block.into(), opts.unwrap_or_default())
-            .await
-            .map_err(Into::into)
-    }
+    ) -> RpcResult<Vec<TraceResult>>;
 
-    /// Handler for `debug_traceTransaction`
+    /// The `debug_traceTransaction` debugging method will attempt to run the transaction in the
+    /// exact same manner as it was executed on the network. It will replay any transaction that
+    /// may have been executed prior to this one before it will finally attempt to execute the
+    /// transaction that corresponds to the given hash.
+    #[method(name = "traceTransaction")]
     async fn debug_trace_transaction(
         &self,
         tx_hash: B256,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<GethTrace> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_transaction(self, tx_hash, opts.unwrap_or_default())
-            .await
-            .map_err(Into::into)
-    }
+    ) -> RpcResult<GethTrace>;
 
-    /// Handler for `debug_traceCall`
+    /// The `debug_traceCall` method lets you run an `eth_call` within the context of the given
+    /// block execution using the final state of parent block as the base.
+    ///
+    /// The first argument (just as in `eth_call`) is a transaction request.
+    /// The block can optionally be specified either by hash or by number as
+    /// the second argument.
+    /// The trace can be configured similar to `debug_traceTransaction`,
+    /// see [`GethDebugTracingOptions`]. The method returns the same output as
+    /// `debug_traceTransaction`.
+    #[method(name = "traceCall")]
     async fn debug_trace_call(
         &self,
-        request: RpcTxReq<Eth::NetworkTypes>,
+        request: TxReq,
         block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
         precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
-    ) -> RpcResult<GethTrace> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_call(self, request, block_id, opts.unwrap_or_default(), precompile_overrides)
-            .await
-            .map_err(Into::into)
-    }
+    ) -> RpcResult<GethTrace>;
 
+    /// The `debug_traceCallMany` method lets you run an `eth_callMany` within the context of the
+    /// given block execution using the final state of parent block as the base followed by n
+    /// transactions.
+    ///
+    /// The first argument is a list of bundles. Each bundle can overwrite the block headers. This
+    /// will affect all transaction in that bundle.
+    /// `BlockNumber` and `transaction_index` are optional. `Transaction_index`
+    /// specifies the number of tx in the block to replay and -1 means all transactions should be
+    /// replayed.
+    /// The trace can be configured similar to `debug_traceTransaction`.
+    /// State override apply to all bundles.
+    ///
+    /// This methods is similar to many `eth_callMany`, hence this returns nested lists of traces.
+    /// Where the length of the outer list is the number of bundles and the length of the inner list
+    /// (`Vec<GethTrace>`) is the number of transactions in the bundle.
+    #[method(name = "traceCallMany")]
     async fn debug_trace_call_many(
         &self,
-        bundles: Vec<Bundle<RpcTxReq<Eth::NetworkTypes>>>,
+        bundles: Vec<Bundle<TxReq>>,
         state_context: Option<StateContext>,
         opts: Option<GethDebugTracingCallOptions>,
-    ) -> RpcResult<Vec<Vec<GethTrace>>> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_call_many(self, bundles, state_context, opts).await.map_err(Into::into)
-    }
+    ) -> RpcResult<Vec<Vec<GethTrace>>>;
 
-    /// Handler for `debug_executionWitness`
-    async fn debug_execution_witness(
-        &self,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<ExecutionWitness> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_execution_witness(self, block).await.map_err(Into::into)
-    }
+    /// The `debug_executionWitness` method allows for re-execution of a block with the purpose of
+    /// generating an execution witness. The witness comprises of a map of all hashed trie nodes
+    /// to their preimages that were required during the execution of the block, including during
+    /// state root recomputation.
+    ///
+    /// The first argument is the block number or tag.
+    #[method(name = "executionWitness")]
+    async fn debug_execution_witness(&self, block: BlockNumberOrTag)
+        -> RpcResult<ExecutionWitness>;
 
-    /// Handler for `debug_executionWitnessByBlockHash`
+    /// The `debug_executionWitnessByBlockHash` method allows for re-execution of a block with the
+    /// purpose of generating an execution witness. The witness comprises of a map of all hashed
+    /// trie nodes to their preimages that were required during the execution of the block,
+    /// including during state root recomputation.
+    ///
+    /// The first argument is the block hash.
+    #[method(name = "executionWitnessByBlockHash")]
     async fn debug_execution_witness_by_block_hash(
         &self,
         hash: B256,
-    ) -> RpcResult<ExecutionWitness> {
-        let _permit = self.acquire_trace_permit().await;
-        Self::debug_execution_witness_by_block_hash(self, hash).await.map_err(Into::into)
-    }
+    ) -> RpcResult<ExecutionWitness>;
 
-    async fn debug_backtrace_at(&self, _location: &str) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the logging backtrace location. When a backtrace location is set and a log message is
+    /// emitted at that location, the stack of the goroutine executing the log statement will
+    /// be printed to stderr.
+    #[method(name = "backtraceAt")]
+    async fn debug_backtrace_at(&self, location: &str) -> RpcResult<()>;
 
+    /// Enumerates all accounts at a given block with paging capability. `maxResults` are returned
+    /// in the page and the items have keys that come after the `start` key (hashed address).
+    ///
+    /// If incompletes is false, then accounts for which the key preimage (i.e: the address) doesn't
+    /// exist in db are skipped. NB: geth by default does not store preimages.
+    #[method(name = "accountRange")]
     async fn debug_account_range(
         &self,
-        _block_number: BlockNumberOrTag,
-        _start: Bytes,
-        _max_results: u64,
-        _nocode: bool,
-        _nostorage: bool,
-        _incompletes: bool,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        block_number: BlockNumberOrTag,
+        start: Bytes,
+        max_results: u64,
+        nocode: bool,
+        nostorage: bool,
+        incompletes: bool,
+    ) -> RpcResult<()>;
 
-    async fn debug_block_profile(&self, _file: String, _seconds: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Turns on block profiling for the given duration and writes profile data to disk. It uses a
+    /// profile rate of 1 for most accurate information. If a different rate is desired, set the
+    /// rate and write the profile manually using `debug_writeBlockProfile`.
+    #[method(name = "blockProfile")]
+    async fn debug_block_profile(&self, file: String, seconds: u64) -> RpcResult<()>;
 
-    async fn debug_chaindb_compact(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Flattens the entire key-value database into a single level, removing all unused slots and
+    /// merging all keys.
+    #[method(name = "chaindbCompact")]
+    async fn debug_chaindb_compact(&self) -> RpcResult<()>;
 
-    async fn debug_chain_config(&self) -> RpcResult<ChainConfig> {
-        Ok(self.provider().chain_spec().genesis().config.clone())
-    }
+    /// Returns the current chain config.
+    #[method(name = "chainConfig")]
+    async fn debug_chain_config(&self) -> RpcResult<ChainConfig>;
 
-    async fn debug_chaindb_property(&self, _property: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns leveldb properties of the key-value database.
+    #[method(name = "chaindbProperty")]
+    async fn debug_chaindb_property(&self, property: String) -> RpcResult<()>;
 
+    /// Returns the code associated with a given hash at the specified block ID.
+    /// If no block ID is provided, it defaults to the latest block.
+    #[method(name = "codeByHash")]
     async fn debug_code_by_hash(
         &self,
         hash: B256,
         block_id: Option<BlockId>,
-    ) -> RpcResult<Option<Bytes>> {
-        Self::debug_code_by_hash(self, hash, block_id).await.map_err(Into::into)
-    }
+    ) -> RpcResult<Option<Bytes>>;
 
-    async fn debug_cpu_profile(&self, _file: String, _seconds: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Turns on CPU profiling for the given duration and writes profile data to disk.
+    #[method(name = "cpuProfile")]
+    async fn debug_cpu_profile(&self, file: String, seconds: u64) -> RpcResult<()>;
 
-    async fn debug_db_ancient(&self, _kind: String, _number: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Retrieves an ancient binary blob from the freezer. The freezer is a collection of
+    /// append-only immutable files. The first argument `kind` specifies which table to look up data
+    /// from. The list of all table kinds are as follows:
+    #[method(name = "dbAncient")]
+    async fn debug_db_ancient(&self, kind: String, number: u64) -> RpcResult<()>;
 
-    async fn debug_db_ancients(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns the number of ancient items in the ancient store.
+    #[method(name = "dbAncients")]
+    async fn debug_db_ancients(&self) -> RpcResult<()>;
 
-    async fn debug_db_get(&self, _key: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns the raw value of a key stored in the database.
+    #[method(name = "dbGet")]
+    async fn debug_db_get(&self, key: String) -> RpcResult<()>;
 
-    async fn debug_dump_block(&self, _number: BlockId) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Retrieves the state that corresponds to the block number and returns a list of accounts
+    /// (including storage and code).
+    #[method(name = "dumpBlock")]
+    async fn debug_dump_block(&self, number: BlockId) -> RpcResult<()>;
 
-    async fn debug_free_os_memory(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Forces garbage collection.
+    #[method(name = "freeOSMemory")]
+    async fn debug_free_os_memory(&self) -> RpcResult<()>;
 
-    async fn debug_freeze_client(&self, _node: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Forces a temporary client freeze, normally when the server is overloaded.
+    #[method(name = "freezeClient")]
+    async fn debug_freeze_client(&self, node: String) -> RpcResult<()>;
 
-    async fn debug_gc_stats(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns garbage collection statistics.
+    #[method(name = "gcStats")]
+    async fn debug_gc_stats(&self) -> RpcResult<()>;
 
+    /// Returns the first number where the node has accessible state on disk. This is the
+    /// post-state of that block and the pre-state of the next block. The (from, to) parameters
+    /// are the sequence of blocks to search, which can go either forwards or backwards.
+    ///
+    /// Note: to get the last state pass in the range of blocks in reverse, i.e. (last, first).
+    #[method(name = "getAccessibleState")]
     async fn debug_get_accessible_state(
         &self,
-        _from: BlockNumberOrTag,
-        _to: BlockNumberOrTag,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        from: BlockNumberOrTag,
+        to: BlockNumberOrTag,
+    ) -> RpcResult<()>;
 
+    /// Returns all accounts that have changed between the two blocks specified. A change is defined
+    /// as a difference in nonce, balance, code hash, or storage hash. With one parameter, returns
+    /// the list of accounts modified in the specified block.
+    #[method(name = "getModifiedAccountsByHash")]
     async fn debug_get_modified_accounts_by_hash(
         &self,
-        _start_hash: B256,
-        _end_hash: B256,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        start_hash: B256,
+        end_hash: B256,
+    ) -> RpcResult<()>;
 
+    /// Returns all accounts that have changed between the two blocks specified. A change is defined
+    /// as a difference in nonce, balance, code hash or storage hash.
+    #[method(name = "getModifiedAccountsByNumber")]
     async fn debug_get_modified_accounts_by_number(
         &self,
-        _start_number: u64,
-        _end_number: u64,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        start_number: u64,
+        end_number: u64,
+    ) -> RpcResult<()>;
 
-    async fn debug_go_trace(&self, _file: String, _seconds: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Turns on Go runtime tracing for the given duration and writes trace data to disk.
+    #[method(name = "goTrace")]
+    async fn debug_go_trace(&self, file: String, seconds: u64) -> RpcResult<()>;
 
+    /// Executes a block (bad- or canon- or side-), and returns a list of intermediate roots: the
+    /// stateroot after each transaction.
+    #[method(name = "intermediateRoots")]
     async fn debug_intermediate_roots(
         &self,
-        _block_hash: B256,
-        _opts: Option<GethDebugTracingCallOptions>,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        block_hash: B256,
+        opts: Option<GethDebugTracingCallOptions>,
+    ) -> RpcResult<()>;
 
-    async fn debug_mem_stats(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns detailed runtime memory statistics.
+    #[method(name = "memStats")]
+    async fn debug_mem_stats(&self) -> RpcResult<()>;
 
-    async fn debug_mutex_profile(&self, _file: String, _nsec: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Turns on mutex profiling for `nsec` seconds and writes profile data to file. It uses a
+    /// profile rate of 1 for most accurate information. If a different rate is desired, set the
+    /// rate and write the profile manually.
+    #[method(name = "mutexProfile")]
+    async fn debug_mutex_profile(&self, file: String, nsec: u64) -> RpcResult<()>;
 
-    async fn debug_preimage(&self, _hash: B256) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns the preimage for a sha3 hash, if known.
+    #[method(name = "preimage")]
+    async fn debug_preimage(&self, hash: B256) -> RpcResult<()>;
 
-    async fn debug_print_block(&self, _number: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Retrieves a block and returns its pretty printed form.
+    #[method(name = "printBlock")]
+    async fn debug_print_block(&self, number: u64) -> RpcResult<()>;
 
-    async fn debug_seed_hash(&self, _number: u64) -> RpcResult<B256> {
-        Ok(Default::default())
-    }
+    /// Fetches and retrieves the seed hash of the block by number.
+    #[method(name = "seedHash")]
+    async fn debug_seed_hash(&self, number: u64) -> RpcResult<B256>;
 
-    async fn debug_set_block_profile_rate(&self, _rate: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the rate (in samples/sec) of goroutine block profile data collection. A non-zero rate
+    /// enables block profiling, setting it to zero stops the profile. Collected profile data can be
+    /// written using `debug_writeBlockProfile`.
+    #[method(name = "setBlockProfileRate")]
+    async fn debug_set_block_profile_rate(&self, rate: u64) -> RpcResult<()>;
 
-    async fn debug_set_gc_percent(&self, _v: i32) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the garbage collection target percentage. A negative value disables garbage collection.
+    #[method(name = "setGCPercent")]
+    async fn debug_set_gc_percent(&self, v: i32) -> RpcResult<()>;
 
-    async fn debug_set_head(&self, _number: u64) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the current head of the local chain by block number. Note, this is a destructive action
+    /// and may severely damage your chain. Use with extreme caution.
+    #[method(name = "setHead")]
+    async fn debug_set_head(&self, number: u64) -> RpcResult<()>;
 
-    async fn debug_set_mutex_profile_fraction(&self, _rate: i32) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the rate of mutex profiling.
+    #[method(name = "setMutexProfileFraction")]
+    async fn debug_set_mutex_profile_fraction(&self, rate: i32) -> RpcResult<()>;
 
-    async fn debug_set_trie_flush_interval(&self, _interval: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Configures how often in-memory state tries are persisted to disk. The interval needs to be
+    /// in a format parsable by a time.Duration. Note that the interval is not wall-clock time.
+    /// Rather it is accumulated block processing time after which the state should be flushed.
+    #[method(name = "setTrieFlushInterval")]
+    async fn debug_set_trie_flush_interval(&self, interval: String) -> RpcResult<()>;
 
-    async fn debug_stacks(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Returns a printed representation of the stacks of all goroutines.
+    #[method(name = "stacks")]
+    async fn debug_stacks(&self) -> RpcResult<()>;
 
+    /// Used to obtain info about a block.
+    #[method(name = "standardTraceBadBlockToFile")]
     async fn debug_standard_trace_bad_block_to_file(
         &self,
-        _block: BlockNumberOrTag,
-        _opts: Option<GethDebugTracingCallOptions>,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        block: BlockNumberOrTag,
+        opts: Option<GethDebugTracingCallOptions>,
+    ) -> RpcResult<()>;
 
+    /// This method is similar to `debug_standardTraceBlockToFile`, but can be used to obtain info
+    /// about a block which has been rejected as invalid (for some reason).
+    #[method(name = "standardTraceBlockToFile")]
     async fn debug_standard_trace_block_to_file(
         &self,
-        _block: BlockNumberOrTag,
-        _opts: Option<GethDebugTracingCallOptions>,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        block: BlockNumberOrTag,
+        opts: Option<GethDebugTracingCallOptions>,
+    ) -> RpcResult<()>;
 
-    async fn debug_start_cpu_profile(&self, _file: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Turns on CPU profiling indefinitely, writing to the given file.
+    #[method(name = "startCPUProfile")]
+    async fn debug_start_cpu_profile(&self, file: String) -> RpcResult<()>;
 
-    async fn debug_start_go_trace(&self, _file: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Starts writing a Go runtime trace to the given file.
+    #[method(name = "startGoTrace")]
+    async fn debug_start_go_trace(&self, file: String) -> RpcResult<()>;
 
+    /// Returns the state root of the `HashedPostState` on top of the state for the given block with
+    /// trie updates.
+    #[method(name = "stateRootWithUpdates")]
     async fn debug_state_root_with_updates(
         &self,
         hashed_state: HashedPostState,
         block_id: Option<BlockId>,
-    ) -> RpcResult<(B256, TrieUpdates)> {
-        Self::debug_state_root_with_updates(self, hashed_state, block_id).await.map_err(Into::into)
-    }
+    ) -> RpcResult<(B256, TrieUpdates)>;
 
-    async fn debug_stop_cpu_profile(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Stops an ongoing CPU profile.
+    #[method(name = "stopCPUProfile")]
+    async fn debug_stop_cpu_profile(&self) -> RpcResult<()>;
 
-    async fn debug_stop_go_trace(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Stops writing the Go runtime trace.
+    #[method(name = "stopGoTrace")]
+    async fn debug_stop_go_trace(&self) -> RpcResult<()>;
 
+    /// Returns the storage at the given block height and transaction index. The result can be
+    /// paged by providing a `maxResult` to cap the number of storage slots returned as well as
+    /// specifying the offset via `keyStart` (hash of storage key).
+    #[method(name = "storageRangeAt")]
     async fn debug_storage_range_at(
         &self,
-        _block_hash: B256,
-        _tx_idx: usize,
-        _contract_address: Address,
-        _key_start: B256,
-        _max_result: u64,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        block_hash: B256,
+        tx_idx: usize,
+        contract_address: Address,
+        key_start: B256,
+        max_result: u64,
+    ) -> RpcResult<()>;
 
+    /// Returns the structured logs created during the execution of EVM against a block pulled
+    /// from the pool of bad ones and returns them as a JSON object. For the second parameter see
+    /// `TraceConfig` reference.
+    #[method(name = "traceBadBlock")]
     async fn debug_trace_bad_block(
         &self,
-        _block_hash: B256,
-        _opts: Option<GethDebugTracingCallOptions>,
-    ) -> RpcResult<()> {
-        Ok(())
-    }
+        block_hash: B256,
+        opts: Option<GethDebugTracingCallOptions>,
+    ) -> RpcResult<()>;
 
-    async fn debug_verbosity(&self, _level: usize) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the logging verbosity ceiling. Log messages with level up to and including the given
+    /// level will be printed.
+    #[method(name = "verbosity")]
+    async fn debug_verbosity(&self, level: usize) -> RpcResult<()>;
 
-    async fn debug_vmodule(&self, _pattern: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Sets the logging verbosity pattern.
+    #[method(name = "vmodule")]
+    async fn debug_vmodule(&self, pattern: String) -> RpcResult<()>;
 
-    async fn debug_write_block_profile(&self, _file: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Writes a goroutine blocking profile to the given file.
+    #[method(name = "writeBlockProfile")]
+    async fn debug_write_block_profile(&self, file: String) -> RpcResult<()>;
 
-    async fn debug_write_mem_profile(&self, _file: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Writes an allocation profile to the given file.
+    #[method(name = "writeMemProfile")]
+    async fn debug_write_mem_profile(&self, file: String) -> RpcResult<()>;
 
-    async fn debug_write_mutex_profile(&self, _file: String) -> RpcResult<()> {
-        Ok(())
-    }
+    /// Writes a goroutine blocking profile to the given file.
+    #[method(name = "writeMutexProfile")]
+    async fn debug_write_mutex_profile(&self, file: String) -> RpcResult<()>;
 }
 
-impl<Eth> std::fmt::Debug for DebugApi<Eth> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DebugApi").finish_non_exhaustive()
-    }
-}
-
-impl<Eth> Clone for DebugApi<Eth> {
-    fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
-    }
-}
-
-struct DebugApiInner<Eth> {
-    /// The implementation of `eth` API
-    eth_api: Eth,
-    // restrict the number of concurrent calls to blocking calls
-    blocking_task_guard: BlockingTaskGuard,
+/// An extension to the `debug_` namespace that provides additional methods for retrieving
+/// witnesses.
+///
+/// This is separate from the regular `debug_` api, because this depends on the network specific
+/// params. For optimism this will expect the optimism specific payload attributes
+#[cfg_attr(not(feature = "client"), rpc(server, namespace = "debug"))]
+#[cfg_attr(feature = "client", rpc(server, client, namespace = "debug"))]
+pub trait DebugExecutionWitnessApi<Attributes> {
+    /// The `debug_executePayload` method allows for re-execution of a group of transactions with
+    /// the purpose of generating an execution witness. The witness comprises of a map of all
+    /// hashed trie nodes to their preimages that were required during the execution of the block,
+    /// including during state root recomputation.
+    ///
+    /// The first argument is the parent block hash. The second argument is the payload
+    /// attributes for the new block.
+    #[method(name = "executePayload")]
+    async fn execute_payload(
+        &self,
+        parent_block_hash: B256,
+        attributes: Attributes,
+    ) -> RpcResult<ExecutionWitness>;
 }
