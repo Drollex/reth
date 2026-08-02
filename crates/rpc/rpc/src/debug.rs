@@ -47,6 +47,24 @@ use revm_inspectors::tracing::{
 use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
+use alloy_primitives::{Log};
+use serde::{Serialize, Deserialize};
+
+use alloy_evm::precompiles::{DynPrecompile,PrecompilesMap};
+use revm::precompile::{Precompiles, PrecompileSpecId};
+
+use alloy_evm::{
+    Evm as _,
+    EthEvm,
+    revm::{
+        handler::EthPrecompiles,
+        precompile::{PrecompileId, PrecompileOutput},
+    },
+};
+use alloy_primitives::{U256};
+
+use reth_rpc_eth_api::helpers::HlPrecompileOverrides;
+
 /// `debug` API implementation.
 ///
 /// This type provides the functionality for handling `debug` related requests.
@@ -274,6 +292,7 @@ where
         call: RpcTxReq<Eth::NetworkTypes>,
         block_id: Option<BlockId>,
         opts: GethDebugTracingCallOptions,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> Result<GethTrace, Eth::Error> {
         let at = block_id.unwrap_or_default();
         let GethDebugTracingCallOptions {
@@ -292,7 +311,7 @@ where
                         let inspector = self
                             .eth_api()
                             .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
-                                this.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
+                                this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides.clone())?;
                                 Ok(inspector)
                             })
                             .await?;
@@ -312,7 +331,7 @@ where
                             .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
                                 let gas_limit = tx_env.gas_limit();
                                 let res =
-                                    this.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
+                                    this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides.clone())?;
                                 let frame = inspector
                                     .with_transaction_gas_limit(gas_limit)
                                     .into_geth_builder()
@@ -338,11 +357,12 @@ where
                                 let db = db.0;
 
                                 let gas_limit = tx_env.gas_limit();
-                                let res = this.eth_api().inspect(
+                                let res = this.eth_api().inspect_with_overrides(
                                     &mut *db,
                                     evm_env,
                                     tx_env,
                                     &mut inspector,
+                                    precompile_overrides.clone(),
                                 )?;
                                 let frame = inspector
                                     .with_transaction_gas_limit(gas_limit)
@@ -379,11 +399,12 @@ where
                                     index: None,
                                 };
 
-                                let res = this.eth_api().inspect(
+                                let res = this.eth_api().inspect_with_overrides(
                                     &mut *db,
                                     evm_env,
                                     tx_env,
                                     &mut inspector,
+                                    precompile_overrides.clone(),
                                 )?;
                                 let frame = inspector
                                     .try_into_mux_frame(&res, db, tx_info)
@@ -407,7 +428,7 @@ where
                             .eth_api
                             .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
                                 let gas_limit = tx_env.gas_limit();
-                                this.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
+                                this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides.clone())?;
                                 let tx_info = TransactionInfo::default();
                                 let frame: FlatCallFrame = inspector
                                     .with_transaction_gas_limit(gas_limit)
@@ -440,11 +461,12 @@ where
                             let mut inspector =
                                 revm_inspectors::tracing::js::JsInspector::new(code, config)
                                     .map_err(Eth::Error::from_eth_err)?;
-                            let res = this.eth_api().inspect(
+                            let res = this.eth_api().inspect_with_overrides(
                                 &mut *db,
                                 evm_env.clone(),
                                 tx_env.clone(),
                                 &mut inspector,
+                                precompile_overrides.clone(),
                             )?;
                             inspector
                                 .json_result(res, &tx_env, &evm_env.block_env, db)
@@ -471,7 +493,7 @@ where
             .eth_api()
             .spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
                 let gas_limit = tx_env.gas_limit();
-                let res = this.eth_api().inspect(db, evm_env, tx_env, &mut inspector)?;
+                let res = this.eth_api().inspect_with_overrides(db, evm_env, tx_env, &mut inspector, precompile_overrides)?;
                 Ok((res, gas_limit, inspector))
             })
             .await?;
@@ -1050,9 +1072,10 @@ where
         request: RpcTxReq<Eth::NetworkTypes>,
         block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> RpcResult<GethTrace> {
         let _permit = self.acquire_trace_permit().await;
-        Self::debug_trace_call(self, request, block_id, opts.unwrap_or_default())
+        Self::debug_trace_call(self, request, block_id, opts.unwrap_or_default(), precompile_overrides)
             .await
             .map_err(Into::into)
     }
