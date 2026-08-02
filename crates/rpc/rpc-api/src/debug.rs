@@ -10,6 +10,8 @@ use alloy_rpc_types_trace::geth::{
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 
+use reth_rpc_eth_api::helpers::HlPrecompileOverrides;
+
 /// Debug rpc interface.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "debug"))]
 #[cfg_attr(feature = "client", rpc(server, client, namespace = "debug"))]
