@@ -109,6 +109,7 @@ pub trait DebugApi<TxReq: RpcObject> {
         request: TxReq,
         block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> RpcResult<GethTrace>;
 
     /// The `debug_traceCallMany` method lets you run an `eth_callMany` within the context of the
