@@ -30,7 +30,7 @@ pub mod transaction;
 
 pub use block::{EthBlocks, LoadBlock};
 pub use blocking_task::SpawnBlocking;
-pub use call::{Call, EthCall};
+pub use call::{Call, EthCall, HlPrecompileOverrides};
 pub use fee::{EthFees, LoadFee};
 pub use pending_block::LoadPendingBlock;
 pub use receipt::LoadReceipt;
