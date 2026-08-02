@@ -39,6 +39,9 @@ use alloy_evm::{
 };
 use alloy_primitives::{Bytes, U256};
 
+use super::HlPrecompileOverrides;
+
+/*
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HlPrecompileOverrides {
@@ -52,7 +55,7 @@ pub struct HlPrecompileOverride {
     pub input: Bytes,
     pub output: Bytes,
 }
-
+*/
 /// Executes CPU heavy tasks.
 pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> {
     /// Executes the [`TxEnvFor`] with [`EvmEnvFor`] against the given [Database] without committing
