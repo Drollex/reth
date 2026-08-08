@@ -255,10 +255,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         block_number: Option<BlockId>,
         overrides: EvmOverrides,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
         async move {
             let res =
-                self.transact_call_at(request, block_number.unwrap_or_default(), overrides).await?;
+                self.transact_call_at_with_precompile_overrides(request, block_number.unwrap_or_default(), overrides, precompile_overrides).await?;
 
             ensure_success(res.result)
         }
@@ -659,6 +660,22 @@ where
         })
     }
 
+    fn transact_call_at_with_precompile_overrides(
+        &self,
+        request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
+        at: BlockId,
+        overrides: EvmOverrides,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+    ) -> impl Future<Output = Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>> + Send
+    where
+        Self: LoadPendingBlock,
+    {
+        let this = self.clone();
+        self.spawn_with_call_at_with_precompile_overrides(request, at, overrides, move |db, evm_env, tx_env, precompile_overrides| {
+            this.transact_with_precompile_overrides(db, evm_env, tx_env, precompile_overrides)
+        }, precompile_overrides)
+    }
+
     /// Executes the closure with the state that corresponds to the given [`BlockId`] on a new task
     fn spawn_with_state_at_block<F, R>(
         &self,
@@ -720,6 +737,43 @@ where
                     this.prepare_call_env(evm_env, request, &mut db, overrides)?;
 
                 f(StateCacheDbRefMutWrapper(&mut db), evm_env, tx_env)
+            })
+            .await
+        }
+    }
+
+    fn spawn_with_call_at_with_precompile_overrides<F, R>(
+        &self,
+        request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
+        at: BlockId,
+        overrides: EvmOverrides,
+        f: F,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+    ) -> impl Future<Output = Result<R, Self::Error>> + Send
+    where
+        Self: LoadPendingBlock,
+        F: FnOnce(
+                StateCacheDbRefMutWrapper<'_, '_>,
+                EvmEnvFor<Self::Evm>,
+                TxEnvFor<Self::Evm>,
+                Option<Vec<HlPrecompileOverrides>>,
+            ) -> Result<R, Self::Error>
+            + Send
+            + 'static,
+        R: Send + 'static,
+    {
+        async move {
+            let (evm_env, at) = self.evm_env_at(at).await?;
+            let this = self.clone();
+            self.spawn_blocking_io_fut(move |_| async move {
+                let state = this.state_at_block_id(at).await?;
+                let mut db =
+                    CacheDB::new(StateProviderDatabase::new(StateProviderTraitObjWrapper(&state)));
+
+                let (evm_env, tx_env) =
+                    this.prepare_call_env(evm_env, request, &mut db, overrides)?;
+
+                f(StateCacheDbRefMutWrapper(&mut db), evm_env, tx_env, precompile_overrides)
             })
             .await
         }
