@@ -227,6 +227,7 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> RpcResult<Bytes>;
 
     /// Simulate arbitrary number of transactions at an arbitrary blockchain index, with the
@@ -673,6 +674,7 @@ where
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
+        precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
     ) -> RpcResult<Bytes> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_call");
         Ok(EthCall::call(
@@ -680,6 +682,7 @@ where
             request,
             block_number,
             EvmOverrides::new(state_overrides, block_overrides),
+            precompile_overrides
         )
         .await?)
     }
