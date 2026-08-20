@@ -421,7 +421,7 @@ where
 impl<H: BlockHeader> BuildPendingEnv<H> for NextBlockEnvAttributes {
     fn build_pending_env(parent: &SealedHeader<H>) -> Self {
         Self {
-            timestamp: parent.timestamp().saturating_add(12),
+            timestamp: parent.timestamp().saturating_add(1),
             suggested_fee_recipient: parent.beneficiary(),
             prev_randao: B256::random(),
             gas_limit: parent.gas_limit(),
