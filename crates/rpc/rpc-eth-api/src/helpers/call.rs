@@ -393,6 +393,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
         precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+        preceding_transactions: Option<Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>>,
     ) -> impl Future<Output = Result<EnhancedAccessListResult, Self::Error>> + Send
     where
         Self: Trace,
@@ -402,7 +403,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let (evm_env, at) = self.evm_env_at(block_id).await?;
 
             self.spawn_blocking_io_fut(move |this| async move {
-                this.create_access_list_with(evm_env, at, request, state_override, precompile_overrides).await
+                this.create_access_list_with(evm_env, at, request, state_override, precompile_overrides, preceding_transactions).await
             })
             .await
         }
@@ -417,6 +418,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         state_override: Option<StateOverride>,
         precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+        preceding_transactions: Option<Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>>,
     ) -> impl Future<Output = Result<EnhancedAccessListResult, Self::Error>> + Send
     where
         Self: Trace,
@@ -430,8 +432,6 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     .map_err(Self::Error::from_eth_err)?;
             }
 
-            let mut tx_env = this.create_txn_env(&evm_env, request.clone(), &mut db)?;
-
             // we want to disable this in eth_createAccessList, since this is common practice used
             // by other node impls and providers <https://github.com/foundry-rs/foundry/issues/4388>
             evm_env.cfg_env.disable_block_gas_limit = true;
@@ -444,6 +444,44 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // Disabled because eth_createAccessList is sometimes used with non-eoa senders
             evm_env.cfg_env.disable_eip3607 = true;
 
+            if let Some(preceding_transactions) = preceding_transactions {
+                for preceding_request in preceding_transactions {
+                    let mut preceding_tx_env =
+                        this.create_txn_env(
+                            &evm_env,
+                            preceding_request.clone(),
+                            &mut db,
+                        )?;
+    
+                    if preceding_request.as_ref().gas_limit().is_none()
+                        && preceding_tx_env.gas_price() > 0
+                    {
+                        let cap =
+                            this.caller_gas_allowance(
+                                &mut db,
+                                &evm_env,
+                                &preceding_tx_env,
+                            )?;
+    
+                        preceding_tx_env.set_gas_limit(
+                            cap.min(evm_env.block_env.gas_limit)
+                        );
+                    }
+    
+                    let result =
+                        this.transact_with_precompile_overrides(
+                            &mut db,
+                            evm_env.clone(),
+                            preceding_tx_env,
+                            precompile_overrides.clone(),
+                        )?;
+    
+                    db.commit(result.state);
+                }
+            }
+
+            let mut tx_env = this.create_txn_env(&evm_env, request.clone(), &mut db)?;
+            
             if request.as_ref().gas_limit().is_none() && tx_env.gas_price() > 0 {
                 let cap = this.caller_gas_allowance(&mut db, &evm_env, &tx_env)?;
                 // no gas limit was provided in the request, so we need to cap the request's gas
