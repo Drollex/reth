@@ -78,6 +78,18 @@ pub struct HlPrecompileOverride {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrecedingTransactionResult {
+    #[serde(flatten)]
+    pub base: AccessListResult,
+
+    pub gas_refunded: Option<U256>,
+    pub pre_refund_gas_used: Option<U256>,
+    pub logs: Vec<Log>,
+    pub pending_block: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EnhancedAccessListResult {
     #[serde(flatten)]
     pub base: AccessListResult,
@@ -86,6 +98,9 @@ pub struct EnhancedAccessListResult {
     pub pre_refund_gas_used: Option<U256>,
     pub logs: Vec<Log>,
     pub pending_block: U256,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preceding_transactions: Vec<PrecedingTransactionResult>,
 }
 
 /// Result type for `eth_simulateV1` RPC method.
@@ -444,6 +459,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // Disabled because eth_createAccessList is sometimes used with non-eoa senders
             evm_env.cfg_env.disable_eip3607 = true;
 
+            let pending_block = U256::from(evm_env.block_env.number);
+            let mut preceding_results = Vec::new();
+
             if let Some(preceding_transactions) = preceding_transactions {
                 for preceding_request in preceding_transactions {
                     let mut preceding_tx_env =
@@ -467,7 +485,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             cap.min(evm_env.block_env.gas_limit)
                         );
                     }
-    
+                    
+                    let gas_limit = preceding_tx_env.gas_limit();
+
                     let result =
                         this.transact_with_precompile_overrides(
                             &mut db,
@@ -476,7 +496,72 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             precompile_overrides.clone(),
                         )?;
     
-                    db.commit(result.state);
+                    let ResultAndState {
+                        result: execution_result,
+                        state,
+                    } = result;    
+                    
+                    let preceding_result = match execution_result {
+                        ExecutionResult::Halt { reason, gas_used } => {
+                            let error =
+                                Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
+
+                            PrecedingTransactionResult {
+                                base: AccessListResult {
+                                    access_list: AccessList::default(),
+                                    gas_used: U256::from(gas_used),
+                                    error,
+                                },
+                                gas_refunded: None,
+                                pre_refund_gas_used: None,
+                                logs: Vec::new(),
+                                pending_block,
+                            }
+                        }
+
+                        ExecutionResult::Revert { output, gas_used } => {
+                            let error = Some(RevertError::new(output).to_string());
+
+                            PrecedingTransactionResult {
+                                base: AccessListResult {
+                                    access_list: AccessList::default(),
+                                    gas_used: U256::from(gas_used),
+                                    error,
+                                },
+                                gas_refunded: None,
+                                pre_refund_gas_used: None,
+                                logs: Vec::new(),
+                                pending_block,
+                            }
+                        }
+
+                        ExecutionResult::Success {
+                            gas_used,
+                            gas_refunded,
+                            logs,
+                            ..
+                        } => {
+                            let gas_used = U256::from(gas_used);
+                            let gas_refunded = U256::from(gas_refunded);
+
+                            PrecedingTransactionResult {
+                                base: AccessListResult {
+                                    access_list: AccessList::default(),
+                                    gas_used,
+                                    error: None,
+                                },
+                                gas_refunded: Some(gas_refunded),
+                                pre_refund_gas_used: Some(
+                                    gas_used + gas_refunded
+                                ),
+                                logs,
+                                pending_block,
+                            }
+                        }
+                    };
+
+                    db.commit(state);
+                    preceding_results.push(preceding_result);
                 }
             }
 
@@ -491,7 +576,6 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             // transact to get the exact gas used
             let gas_limit = tx_env.gas_limit();
-            let pending_block = U256::from(evm_env.block_env.number);
 
             let result = this.transact_with_precompile_overrides(&mut db, evm_env, tx_env, precompile_overrides)?;
 
@@ -511,6 +595,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         pre_refund_gas_used: None,
                         logs: Vec::new(),
                         pending_block,
+                        preceding_transactions: preceding_results,
                     }
                 }
                 ExecutionResult::Revert { output, gas_used } => {
@@ -525,6 +610,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         pre_refund_gas_used: None,
                         logs: Vec::new(),
                         pending_block,
+                        preceding_transactions: preceding_results,
                     }
                 }
                 ExecutionResult::Success { gas_used, gas_refunded, logs, .. } => {
@@ -542,7 +628,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         pre_refund_gas_used: Some(pre_refund_gas_used),
                         logs,
                         pending_block,
+                        preceding_transactions: preceding_results,
                     }
+                    
                 }
             };
 
