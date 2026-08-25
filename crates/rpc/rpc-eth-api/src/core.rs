@@ -261,6 +261,7 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
         precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+        preceding_transactions: Option<Vec<TxReq>>,
     ) -> RpcResult<EnhancedAccessListResult>;
 
     /// Generates and returns an estimate of how much gas is necessary to allow the transaction to
@@ -705,9 +706,10 @@ where
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
         precompile_overrides: Option<Vec<HlPrecompileOverrides>>,
+        preceding_transactions: Option<Vec<RpcTxReq<T::NetworkTypes>>>,
     ) -> RpcResult<EnhancedAccessListResult> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_override, "Serving eth_createAccessList");
-        Ok(EthCall::create_access_list_at(self, request, block_number, state_override, precompile_overrides).await?)
+        Ok(EthCall::create_access_list_at(self, request, block_number, state_override, precompile_overrides, preceding_transactions).await?)
     }
 
     /// Handler for: `eth_estimateGas`
