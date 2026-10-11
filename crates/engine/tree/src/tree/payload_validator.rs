@@ -374,105 +374,21 @@ where
 
         let env = ExecutionEnv { evm_env, hash: input.hash(), parent_hash: input.parent_hash() };
 
-        // We only run the parallel state root if we are not currently persisting any blocks or
-        // persisting blocks that are all ancestors of the one we are executing.
-        //
-        // If we're committing ancestor blocks, then: any trie updates being committed are a subset
-        // of the in-memory trie updates collected before fetching reverts. So any diff in
-        // reverts (pre vs post commit) is already covered by the in-memory trie updates we
-        // collect in `compute_state_root_parallel`.
-        //
-        // See https://github.com/paradigmxyz/reth/issues/12688 for more details
-        let persisting_kind = ctx.persisting_kind_for(input.block_with_parent());
-        // don't run parallel if state root fallback is set
-        let run_parallel_state_root =
-            persisting_kind.can_run_parallel_state_root() && !self.config.state_root_fallback();
-
-        // Use state root task only if:
-        // 1. No persistence is in progress
-        // 2. Config allows it
-        // 3. No ancestors with missing trie updates. If any exist, it will mean that every state
-        //    root task proof calculation will include a lot of unrelated paths in the prefix sets.
-        //    It's cheaper to run a parallel state root that does one walk over trie tables while
-        //    accounting for the prefix sets.
         let has_ancestors_with_missing_trie_updates =
             self.has_ancestors_with_missing_trie_updates(input.block_with_parent(), ctx.state());
-        let mut use_state_root_task = run_parallel_state_root &&
-            self.config.use_state_root_task() &&
-            !has_ancestors_with_missing_trie_updates;
 
-        debug!(
-            target: "engine::tree",
-            block=?block_num_hash,
-            run_parallel_state_root,
-            has_ancestors_with_missing_trie_updates,
-            use_state_root_task,
-            config_allows_state_root_task=self.config.use_state_root_task(),
-            "Deciding which state root algorithm to run"
-        );
-
-        // use prewarming background task
+        // HyperEVM headers carry a zero state root and nanoreth never maintains the trie tables,
+        // so no state root is computed: a proof over storage written after the trie was seeded
+        // walks every slot of that account, which stalls block import for hundreds of
+        // milliseconds as such accounts grow.
         let txs = self.tx_iterator_for(&input)?;
-        let mut handle = if use_state_root_task {
-            // use background tasks for state root calc
-            let consistent_view =
-                ensure_ok!(ConsistentDbView::new_with_latest_tip(self.provider.clone()));
-
-            // get allocated trie input if it exists
-            let allocated_trie_input = self.payload_processor.take_trie_input();
-
-            // Compute trie input
-            let trie_input_start = Instant::now();
-            let trie_input = ensure_ok!(self.compute_trie_input(
-                persisting_kind,
-                ensure_ok!(consistent_view.provider_ro()),
-                parent_hash,
-                ctx.state(),
-                allocated_trie_input,
-            ));
-
-            self.metrics
-                .block_validation
-                .trie_input_duration
-                .record(trie_input_start.elapsed().as_secs_f64());
-
-            // Use state root task only if prefix sets are empty, otherwise proof generation is too
-            // expensive because it requires walking over the paths in the prefix set in every
-            // proof.
-            let spawn_payload_processor_start = Instant::now();
-            let handle = if trie_input.prefix_sets.is_empty() {
-                self.payload_processor.spawn(
-                    env.clone(),
-                    txs,
-                    provider_builder,
-                    consistent_view,
-                    trie_input,
-                    &self.config,
-                )
-            } else {
-                debug!(target: "engine::tree", block=?block_num_hash, "Disabling state root task due to non-empty prefix sets");
-                use_state_root_task = false;
-                self.payload_processor.spawn_cache_exclusive(env.clone(), txs, provider_builder)
-            };
-
-            // record prewarming initialization duration
-            self.metrics
-                .block_validation
-                .spawn_payload_processor
-                .record(spawn_payload_processor_start.elapsed().as_secs_f64());
-            handle
-        } else {
-            let prewarming_start = Instant::now();
-            let handle =
-                self.payload_processor.spawn_cache_exclusive(env.clone(), txs, provider_builder);
-
-            // Record prewarming initialization duration
-            self.metrics
-                .block_validation
-                .spawn_payload_processor
-                .record(prewarming_start.elapsed().as_secs_f64());
-            handle
-        };
+        let prewarming_start = Instant::now();
+        let mut handle =
+            self.payload_processor.spawn_cache_exclusive(env.clone(), txs, provider_builder);
+        self.metrics
+            .block_validation
+            .spawn_payload_processor
+            .record(prewarming_start.elapsed().as_secs_f64());
 
         // Use cached state provider before executing, used in execution after prewarming threads
         // complete
@@ -545,82 +461,7 @@ where
             .post_execution_validation_duration
             .record(post_execution_start.elapsed().as_secs_f64());
 
-        debug!(target: "engine::tree", block=?block_num_hash, "Calculating block state root");
-
-        let root_time = Instant::now();
-
-        let mut maybe_state_root = None;
-
-        if run_parallel_state_root {
-            // if we new payload extends the current canonical change we attempt to use the
-            // background task or try to compute it in parallel
-            if use_state_root_task {
-                debug!(target: "engine::tree", block=?block_num_hash, "Using sparse trie state root algorithm");
-                match handle.state_root() {
-                    Ok(StateRootComputeOutcome { state_root: _, trie_updates }) => {
-                        let elapsed = root_time.elapsed();
-                        let state_root = B256::ZERO;
-                        info!(target: "engine::tree", ?state_root, ?elapsed, "State root task finished");
-                        // we double check the state root here for good measure
-                        if state_root == block.header().state_root() {
-                            maybe_state_root = Some((state_root, trie_updates, elapsed))
-                        } else {
-                            warn!(
-                                target: "engine::tree",
-                                ?state_root,
-                                block_state_root = ?block.header().state_root(),
-                                "State root task returned incorrect state root"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        debug!(target: "engine::tree", %error, "State root task failed");
-                    }
-                }
-            } else {
-                debug!(target: "engine::tree", block=?block_num_hash, "Using parallel state root algorithm");
-                match self.compute_state_root_parallel(
-                    persisting_kind,
-                    block.parent_hash(),
-                    &hashed_state,
-                    ctx.state(),
-                ) {
-                    Ok(result) => {
-                        info!(
-                            target: "engine::tree",
-                            block = ?block_num_hash,
-                            regular_state_root = ?result.0,
-                            "Regular root task finished"
-                        );
-                        maybe_state_root = Some((result.0, result.1, root_time.elapsed()));
-                    }
-                    Err(error) => {
-                        debug!(target: "engine::tree", %error, "Parallel state root computation failed");
-                    }
-                }
-            }
-        }
-
-        let (_state_root, trie_output, root_elapsed) = if let Some(maybe_state_root) =
-            maybe_state_root
-        {
-            maybe_state_root
-        } else {
-            // fallback is to compute the state root regularly in sync
-            if self.config.state_root_fallback() {
-                debug!(target: "engine::tree", block=?block_num_hash, "Using state root fallback for testing");
-            } else {
-                warn!(target: "engine::tree", block=?block_num_hash, ?persisting_kind, "Failed to compute state root in parallel");
-                self.metrics.block_validation.state_root_parallel_fallback_total.increment(1);
-            }
-
-            let (root, updates) =
-                ensure_ok!(state_provider.state_root_with_updates(hashed_state.clone()));
-            (root, updates, root_time.elapsed())
-        };
-
-        self.metrics.block_validation.record_state_root(&trie_output, root_elapsed.as_secs_f64());
-        debug!(target: "engine::tree", ?root_elapsed, block=?block_num_hash, "Calculated state root");
+        let trie_output = TrieUpdates::default();
 
         // ensure state root matches
         let state_root = B256::ZERO;
